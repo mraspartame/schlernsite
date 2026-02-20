@@ -1,0 +1,17 @@
+---
+import Layout from '@layouts/Default.astro';
+import PdfEditor from '../../components/apps/PdfEditor';
+---
+
+<Layout
+  title='PDF Editor'
+  pageTitle='Schlern | PDF Editor'
+  description='View, annotate, and rearrange PDF pages — add markup, reorder or delete pages, then save.'
+>
+  <main class='bg-orange p-4' style='min-height: calc(100vh - 80px);'>
+    <div class='mb-3'>
+      <a href='/apps/' class='poppins font-bold hover:underline'>&larr; All Apps</a>
+    </div>
+    <PdfEditor client:only='react' />
+  </main>
+</Layout>

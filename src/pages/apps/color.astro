@@ -1,0 +1,17 @@
+---
+import Layout from '@layouts/Default.astro';
+import ColorEditor from '../../components/apps/ColorEditor';
+---
+
+<Layout
+  title='Color Editor'
+  pageTitle='Schlern | Color Editor'
+  description='Color-grade your photos with brightness, contrast, saturation, hue, curves, and channel adjustments.'
+>
+  <main class='bg-purple p-6'>
+    <div class='mb-4'>
+      <a href='/apps/' class='poppins font-bold hover:underline'>&larr; All Apps</a>
+    </div>
+    <ColorEditor client:only='react' />
+  </main>
+</Layout>

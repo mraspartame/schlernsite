@@ -1,0 +1,84 @@
+---
+import Layout from '@layouts/Default.astro';
+import { locations } from '../../data/gallery/locations';
+import MapGallery from '../../components/gallery/MapGallery';
+import { Card, Button } from '@eliancodes/brutal-ui';
+---
+
+<Layout
+  title='Gallery'
+  pageTitle='Schlern | Gallery'
+  description='Landscape photography from around the world, mapped by location.'
+>
+  <main class='bg-blue p-6'>
+    <section class='mb-8'>
+      <Card>
+        <div class='flex justify-between items-start gap-4 flex-wrap'>
+          <div>
+            <h1 class='dm-serif text-4xl md:text-6xl mb-2'>Gallery</h1>
+            <p class='poppins text-lg'>
+              Landscape photography, mapped by place. Click a marker to explore photos from that location.
+            </p>
+          </div>
+          <div class='flex gap-2'>
+            <button
+              id='btn-map'
+              class='border-2 border-black px-4 py-2 font-bold bg-white hover:bg-black hover:text-white transition-colors poppins'
+              onclick="document.getElementById('map-view').classList.remove('hidden'); document.getElementById('grid-view').classList.add('hidden')"
+            >
+              Map View
+            </button>
+            <button
+              id='btn-grid'
+              class='border-2 border-black px-4 py-2 font-bold bg-white hover:bg-black hover:text-white transition-colors poppins'
+              onclick="document.getElementById('grid-view').classList.remove('hidden'); document.getElementById('map-view').classList.add('hidden')"
+            >
+              Grid View
+            </button>
+          </div>
+        </div>
+      </Card>
+    </section>
+
+    <!-- Map View -->
+    <div id='map-view' class='mb-8'>
+      <div class='border-4 border-black' style='height: 600px;'>
+        <MapGallery locations={locations} client:only='react' />
+      </div>
+    </div>
+
+    <!-- Grid View (hidden by default) -->
+    <div id='grid-view' class='hidden mb-8'>
+      {
+        locations.length === 0 ? (
+          <Card>
+            <p class='poppins text-lg'>No locations added yet. Add entries to <code>src/data/gallery/locations.ts</code> to get started.</p>
+          </Card>
+        ) : (
+          <div class='grid md:grid-cols-2 lg:grid-cols-3 gap-6'>
+            {locations.map((loc) => (
+              <a href={`/gallery/${loc.slug}/`} class='block card-shadow'>
+                <div class='border-4 border-black bg-white'>
+                  <div class='border-b-4 border-black bg-black aspect-video flex items-center justify-center overflow-hidden'>
+                    <img
+                      src={`/gallery/${loc.slug}/${loc.coverPhoto}`}
+                      alt={loc.name}
+                      class='w-full h-full object-cover'
+                      onerror="this.parentElement.innerHTML='<span class=\'text-white poppins p-4 text-sm\'>No cover photo yet</span>'"
+                    />
+                  </div>
+                  <div class='p-4'>
+                    <h2 class='dm-serif text-2xl'>{loc.name}</h2>
+                    <p class='poppins text-sm text-gray-600'>{loc.region}</p>
+                    <p class='poppins mt-2 text-sm'>{loc.description}</p>
+                    <p class='poppins mt-3 text-xs font-bold'>{loc.photos.length} photo{loc.photos.length !== 1 ? 's' : ''}</p>
+                  </div>
+                </div>
+              </a>
+            ))}
+          </div>
+        )
+      }
+    </div>
+  </main>
+</Layout>

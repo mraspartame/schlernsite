@@ -1,0 +1,53 @@
+---
+import Layout from '@layouts/Default.astro';
+import { locations } from '../../data/gallery/locations';
+import Lightbox from '../../components/gallery/Lightbox';
+
+export function getStaticPaths() {
+  return locations.map((loc) => ({
+    params: { location: loc.slug },
+    props: { location: loc },
+  }));
+}
+
+const { location } = Astro.props;
+---
+
+<Layout
+  title={`${location.name} — Gallery`}
+  pageTitle={`Schlern | ${location.name}`}
+  description={location.description}
+>
+  <main class='bg-blue p-6'>
+    <div class='mb-6'>
+      <a href='/gallery/' class='poppins font-bold hover:underline'>&larr; Back to Gallery</a>
+    </div>
+
+    <div class='border-4 border-black bg-white p-6 mb-8'>
+      <h1 class='dm-serif text-4xl md:text-6xl mb-1'>{location.name}</h1>
+      <p class='poppins text-lg text-gray-600 mb-3'>{location.region}</p>
+      <p class='poppins'>{location.description}</p>
+    </div>
+
+    {
+      location.photos.length === 0 ? (
+        <div class='border-4 border-black bg-white p-8 text-center'>
+          <p class='poppins text-xl mb-2'>No photos yet for this location.</p>
+          <p class='poppins text-sm text-gray-500'>
+            Add photo filenames to <code>src/data/gallery/locations.ts</code> under the <strong>{location.slug}</strong> entry,
+            and place the image files in <code>public/gallery/{location.slug}/</code>.
+          </p>
+        </div>
+      ) : (
+        <Lightbox
+          photos={location.photos.map((p) => ({
+            src: `/gallery/${location.slug}/${p.filename}`,
+            thumb: p.thumb ? `/gallery/${location.slug}/${p.thumb}` : `/gallery/${location.slug}/${p.filename}`,
+            caption: p.caption,
+          }))}
+          client:only='react'
+        />
+      )
+    }
+  </main>
+</Layout>

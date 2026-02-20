@@ -1,0 +1,1123 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const W = 900, H = 600;
+const HANDLE_R = 8;   // hit radius for resize handles (px)
+const HANDLE_SZ = 8;  // visual size of handles (px)
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type Tool = 'select' | 'pencil' | 'eraser' | 'fill' | 'line' | 'rect' | 'ellipse' | 'text';
+type BlendMode = 'source-over' | 'multiply' | 'screen' | 'overlay';
+type HandlePos = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+
+interface Layer {
+  id: string;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  blendMode: BlendMode;
+}
+
+// Moveable objects (shapes, text, images)
+type ObjType = 'rect' | 'ellipse' | 'line' | 'text' | 'image';
+
+interface PaintObj {
+  id: string;
+  layerId: string;
+  type: ObjType;
+  x: number; y: number; w: number; h: number;
+  opacity: number;
+  // shape
+  strokeColor?: string;
+  strokeWidth?: number;
+  // text
+  text?: string;
+  fontSize?: number;
+  color?: string;
+  // image
+  src?: string;
+}
+
+// ── Pure utility functions (outside component) ────────────────────────────────
+
+const uid = () => Math.random().toString(36).slice(2, 7);
+
+/** Bounding box for display/hit-testing (lines have signed w,h for direction) */
+function getDisplayBounds(o: PaintObj) {
+  if (o.type === 'line') {
+    return {
+      x: Math.min(o.x, o.x + o.w),
+      y: Math.min(o.y, o.y + o.h),
+      w: Math.abs(o.w),
+      h: Math.abs(o.h),
+    };
+  }
+  return { x: o.x, y: o.y, w: o.w, h: o.h };
+}
+
+function ptSegDist(px: number, py: number, ax: number, ay: number, bx: number, by: number) {
+  const dx = bx - ax, dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+  return Math.hypot(px - ax - t * dx, py - ay - t * dy);
+}
+
+function hitTest(o: PaintObj, px: number, py: number): boolean {
+  if (o.type === 'line') {
+    const d = ptSegDist(px, py, o.x, o.y, o.x + o.w, o.y + o.h);
+    return d < (o.strokeWidth ?? 2) / 2 + 6;
+  }
+  const { x, y, w, h } = getDisplayBounds(o);
+  return px >= x - 4 && px <= x + w + 4 && py >= y - 4 && py <= y + h + 4;
+}
+
+function getHandles(o: PaintObj): { pos: HandlePos; x: number; y: number }[] {
+  if (o.type === 'line') {
+    return [
+      { pos: 'nw', x: o.x, y: o.y },
+      { pos: 'se', x: o.x + o.w, y: o.y + o.h },
+    ];
+  }
+  const { x, y, w, h } = getDisplayBounds(o);
+  return [
+    { pos: 'nw', x, y },
+    { pos: 'n', x: x + w / 2, y },
+    { pos: 'ne', x: x + w, y },
+    { pos: 'e', x: x + w, y: y + h / 2 },
+    { pos: 'se', x: x + w, y: y + h },
+    { pos: 's', x: x + w / 2, y: y + h },
+    { pos: 'sw', x, y: y + h },
+    { pos: 'w', x, y: y + h / 2 },
+  ];
+}
+
+function handleAt(o: PaintObj, px: number, py: number): HandlePos | null {
+  for (const h of getHandles(o)) {
+    if (Math.abs(px - h.x) < HANDLE_R && Math.abs(py - h.y) < HANDLE_R) return h.pos;
+  }
+  return null;
+}
+
+function applyResize(orig: PaintObj, handle: HandlePos, dx: number, dy: number): PaintObj {
+  const o = { ...orig };
+  if (o.type === 'line') {
+    if (handle === 'nw') { o.x += dx; o.y += dy; o.w -= dx; o.h -= dy; }
+    if (handle === 'se') { o.w += dx; o.h += dy; }
+    return o;
+  }
+  switch (handle) {
+    case 'nw': o.x += dx; o.y += dy; o.w -= dx; o.h -= dy; break;
+    case 'n':  o.y += dy; o.h -= dy; break;
+    case 'ne': o.y += dy; o.w += dx; o.h -= dy; break;
+    case 'e':  o.w += dx; break;
+    case 'se': o.w += dx; o.h += dy; break;
+    case 's':  o.h += dy; break;
+    case 'sw': o.x += dx; o.w -= dx; o.h += dy; break;
+    case 'w':  o.x += dx; o.w -= dx; break;
+  }
+  return o;
+}
+
+function normBounds(o: PaintObj): PaintObj {
+  if (o.type === 'line') return o;
+  const r = { ...o };
+  if (r.w < 0) { r.x += r.w; r.w = -r.w; }
+  if (r.h < 0) { r.y += r.h; r.h = -r.h; }
+  return r;
+}
+
+function measureText(text: string, fontSize: number): { w: number; h: number } {
+  const c = document.createElement('canvas').getContext('2d')!;
+  c.font = `${fontSize}px Poppins, sans-serif`;
+  return { w: Math.ceil(c.measureText(text).width), h: Math.ceil(fontSize * 1.4) };
+}
+
+function drawObj(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<string, HTMLImageElement>) {
+  ctx.save();
+  ctx.globalAlpha = o.opacity;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  switch (o.type) {
+    case 'rect':
+      ctx.strokeStyle = o.strokeColor ?? '#000';
+      ctx.lineWidth = o.strokeWidth ?? 2;
+      ctx.beginPath();
+      ctx.rect(o.x, o.y, o.w, o.h);
+      ctx.stroke();
+      break;
+    case 'ellipse':
+      ctx.strokeStyle = o.strokeColor ?? '#000';
+      ctx.lineWidth = o.strokeWidth ?? 2;
+      ctx.beginPath();
+      ctx.ellipse(o.x + o.w / 2, o.y + o.h / 2, Math.abs(o.w / 2), Math.abs(o.h / 2), 0, 0, Math.PI * 2);
+      ctx.stroke();
+      break;
+    case 'line':
+      ctx.strokeStyle = o.strokeColor ?? '#000';
+      ctx.lineWidth = o.strokeWidth ?? 2;
+      ctx.beginPath();
+      ctx.moveTo(o.x, o.y);
+      ctx.lineTo(o.x + o.w, o.y + o.h);
+      ctx.stroke();
+      break;
+    case 'text':
+      ctx.fillStyle = o.color ?? '#000';
+      ctx.font = `${o.fontSize ?? 24}px Poppins, sans-serif`;
+      ctx.textBaseline = 'top';
+      ctx.fillText(o.text ?? '', o.x, o.y);
+      break;
+    case 'image': {
+      const img = imgCache.get(o.src ?? '');
+      if (img) ctx.drawImage(img, o.x, o.y, o.w, o.h);
+      break;
+    }
+  }
+  ctx.restore();
+}
+
+/**
+ * Flood fill that READS boundaries from `readCtx` and WRITES fill to `writeCtx`.
+ * This lets us use the visual composite (with shape objects) as the boundary
+ * while writing only to the raster pixel canvas.
+ */
+function floodFill(
+  readCtx: CanvasRenderingContext2D,
+  writeCtx: CanvasRenderingContext2D,
+  px: number, py: number,
+  hex: string, opacity: number,
+) {
+  const CW = readCtx.canvas.width, CH = readCtx.canvas.height;
+  const readImg = readCtx.getImageData(0, 0, CW, CH);
+  const writeImg = writeCtx.getImageData(0, 0, CW, CH);
+  const rd = readImg.data, wd = writeImg.data;
+
+  const ix = Math.round(Math.min(Math.max(px, 0), CW - 1));
+  const iy = Math.round(Math.min(Math.max(py, 0), CH - 1));
+  const i0 = (iy * CW + ix) * 4;
+  const [tr, tg, tb, ta] = [rd[i0], rd[i0 + 1], rd[i0 + 2], rd[i0 + 3]];
+
+  const h = hex.replace('#', '');
+  const fr = parseInt(h.slice(0, 2), 16);
+  const fg = parseInt(h.slice(2, 4), 16);
+  const fb = parseInt(h.slice(4, 6), 16);
+  const fa = Math.round(opacity * 255);
+
+  if (tr === fr && tg === fg && tb === fb && ta === fa) return;
+
+  const TOL = 20;
+  const matches = (i: number) =>
+    Math.abs(rd[i] - tr) <= TOL &&
+    Math.abs(rd[i + 1] - tg) <= TOL &&
+    Math.abs(rd[i + 2] - tb) <= TOL &&
+    Math.abs(rd[i + 3] - ta) <= TOL;
+
+  const visited = new Uint8Array(CW * CH);
+  const stack = [i0];
+
+  while (stack.length) {
+    const i = stack.pop()!;
+    const pi = i >> 2;
+    if (visited[pi] || !matches(i)) continue;
+    visited[pi] = 1;
+    wd[i] = fr; wd[i + 1] = fg; wd[i + 2] = fb; wd[i + 3] = fa;
+    const x = pi % CW, y = Math.floor(pi / CW);
+    if (x > 0) stack.push(i - 4);
+    if (x < CW - 1) stack.push(i + 4);
+    if (y > 0) stack.push(i - CW * 4);
+    if (y < CH - 1) stack.push(i + CW * 4);
+  }
+  writeCtx.putImageData(writeImg, 0, 0);
+}
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+
+const S = {
+  panel: { border: '2px solid #000', background: '#fff', padding: '10px' } as React.CSSProperties,
+  toolBtn: (active: boolean) => ({
+    border: '2px solid #000',
+    background: active ? '#000' : '#fff',
+    color: active ? '#fff' : '#000',
+    padding: '5px 8px',
+    fontSize: 13,
+    cursor: 'pointer',
+    fontFamily: 'Poppins, sans-serif',
+    fontWeight: 700,
+    width: '100%',
+    textAlign: 'left' as const,
+    display: 'block',
+    marginBottom: 2,
+    boxSizing: 'border-box' as const,
+  }),
+  smallBtn: (bg = '#fff', fg = '#000') => ({
+    border: '1px solid #000', background: bg, color: fg,
+    padding: '2px 6px', fontSize: 11, cursor: 'pointer',
+    fontFamily: 'Poppins, sans-serif', fontWeight: 700,
+  } as React.CSSProperties),
+  label: { fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, display: 'block', marginBottom: 2 } as React.CSSProperties,
+  input: { border: '1px solid #000', padding: '3px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 4 },
+};
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export default function PaintEditor() {
+  // ── State ──────────────────────────────────────────────────────────────────
+  const [layers, setLayers] = useState<Layer[]>([]);
+  const [activeLayerId, setActiveLayerId] = useState<string | null>(null);
+  const [objects, setObjects] = useState<PaintObj[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tool, setTool] = useState<Tool>('pencil');
+  const [color, setColor] = useState('#000000');
+  const [brushSize, setBrushSize] = useState(4);
+  const [opacity, setOpacity] = useState(1);
+  const [textInput, setTextInput] = useState('Hello');
+  const [fontSize, setFontSize] = useState(24);
+
+  // ── Refs (always-fresh values for event callbacks) ─────────────────────────
+  const layersRef = useRef(layers);           layersRef.current = layers;
+  const objectsRef = useRef(objects);         objectsRef.current = objects;
+  const selectedIdRef = useRef(selectedId);   selectedIdRef.current = selectedId;
+  const toolRef = useRef(tool);               toolRef.current = tool;
+  const colorRef = useRef(color);             colorRef.current = color;
+  const brushSizeRef = useRef(brushSize);     brushSizeRef.current = brushSize;
+  const opacityRef = useRef(opacity);         opacityRef.current = opacity;
+  const textInputRef = useRef(textInput);     textInputRef.current = textInput;
+  const fontSizeRef = useRef(fontSize);       fontSizeRef.current = fontSize;
+  const activeLayerRef = useRef(activeLayerId); activeLayerRef.current = activeLayerId;
+
+  // ── Canvas refs ────────────────────────────────────────────────────────────
+  const displayRef = useRef<HTMLCanvasElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  /** Per-layer raster pixel canvas (pencil / eraser / fill) */
+  const pixelCanvases = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  /** Per-layer temp canvas for compositing pixels + objects */
+  const tempCanvases = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
+
+  // ── Interaction state (refs to avoid stale closures in handlers) ───────────
+  const drawing = useRef(false);
+  const startPos = useRef<{ x: number; y: number } | null>(null);
+  const lastPos = useRef<{ x: number; y: number } | null>(null);
+  const strokePoints = useRef<{ x: number; y: number }[]>([]);
+  const pixelSnapshot = useRef<ImageData | null>(null);
+
+  // For select tool drag
+  const dragMode = useRef<'move' | 'resize' | null>(null);
+  const dragHandle = useRef<HandlePos | null>(null);
+  const dragOrigObj = useRef<PaintObj | null>(null);
+
+  // For text cursor preview
+  const cursorPos = useRef<{ x: number; y: number } | null>(null);
+
+  // ── History ────────────────────────────────────────────────────────────────
+  const history = useRef<{ pixels: { id: string; data: ImageData }[]; objects: PaintObj[] }[]>([]);
+  const histIdx = useRef(-1);
+
+  // ── Rendering ──────────────────────────────────────────────────────────────
+
+  function getTempCanvas(layerId: string): HTMLCanvasElement {
+    if (!tempCanvases.current.has(layerId)) {
+      const c = document.createElement('canvas');
+      c.width = W; c.height = H;
+      tempCanvases.current.set(layerId, c);
+    }
+    return tempCanvases.current.get(layerId)!;
+  }
+
+  const renderAll = useCallback((
+    currentLayers: Layer[],
+    currentObjects: PaintObj[],
+    currentSelectedId: string | null,
+    previewShape?: { type: ObjType; x: number; y: number; w: number; h: number } | null,
+  ) => {
+    if (!displayRef.current || !overlayRef.current) return;
+    const display = displayRef.current.getContext('2d')!;
+    const overlay = overlayRef.current.getContext('2d')!;
+
+    // Composite layers onto display
+    display.clearRect(0, 0, W, H);
+    display.fillStyle = '#fff';
+    display.fillRect(0, 0, W, H);
+
+    for (const layer of currentLayers) {
+      if (!layer.visible) continue;
+      const pc = pixelCanvases.current.get(layer.id);
+      if (!pc) continue;
+
+      const tc = getTempCanvas(layer.id);
+      const tcCtx = tc.getContext('2d')!;
+      tcCtx.clearRect(0, 0, W, H);
+      tcCtx.drawImage(pc, 0, 0);
+      currentObjects
+        .filter((o) => o.layerId === layer.id)
+        .forEach((o) => drawObj(tcCtx, o, imageCache.current));
+
+      display.globalAlpha = layer.opacity;
+      display.globalCompositeOperation = layer.blendMode;
+      display.drawImage(tc, 0, 0);
+      display.globalAlpha = 1;
+      display.globalCompositeOperation = 'source-over';
+    }
+
+    // Overlay: selection handles + shape/text preview
+    overlay.clearRect(0, 0, W, H);
+
+    // Draw selected object highlight
+    if (currentSelectedId) {
+      const sel = currentObjects.find((o) => o.id === currentSelectedId);
+      if (sel) {
+        const { x, y, w, h } = getDisplayBounds(sel);
+        overlay.save();
+        overlay.strokeStyle = '#0088ff';
+        overlay.lineWidth = 1.5;
+        overlay.setLineDash([5, 3]);
+        overlay.strokeRect(x - 2, y - 2, w + 4, h + 4);
+        overlay.setLineDash([]);
+        // Handles
+        overlay.fillStyle = '#fff';
+        overlay.strokeStyle = '#0088ff';
+        overlay.lineWidth = 1.5;
+        for (const h of getHandles(sel)) {
+          overlay.fillRect(h.x - HANDLE_SZ / 2, h.y - HANDLE_SZ / 2, HANDLE_SZ, HANDLE_SZ);
+          overlay.strokeRect(h.x - HANDLE_SZ / 2, h.y - HANDLE_SZ / 2, HANDLE_SZ, HANDLE_SZ);
+        }
+        overlay.restore();
+      }
+    }
+
+    // Draw shape creation preview
+    if (previewShape) {
+      overlay.save();
+      overlay.strokeStyle = colorRef.current;
+      overlay.lineWidth = brushSizeRef.current;
+      overlay.globalAlpha = opacityRef.current;
+      overlay.lineCap = 'round';
+      overlay.setLineDash([4, 4]);
+      const { type, x, y, w, h } = previewShape;
+      if (type === 'rect') {
+        overlay.beginPath();
+        overlay.rect(x, y, w, h);
+        overlay.stroke();
+      } else if (type === 'ellipse') {
+        overlay.beginPath();
+        overlay.ellipse(x + w / 2, y + h / 2, Math.abs(w / 2), Math.abs(h / 2), 0, 0, Math.PI * 2);
+        overlay.stroke();
+      } else if (type === 'line') {
+        overlay.beginPath();
+        overlay.moveTo(x, y);
+        overlay.lineTo(x + w, y + h);
+        overlay.stroke();
+      }
+      overlay.restore();
+    }
+
+    // Text cursor preview
+    if (toolRef.current === 'text' && cursorPos.current) {
+      const { x, y } = cursorPos.current;
+      const fSize = fontSizeRef.current;
+      const txt = textInputRef.current || 'Click to place text';
+      overlay.save();
+      overlay.globalAlpha = 0.5;
+      overlay.fillStyle = colorRef.current;
+      overlay.font = `${fSize}px Poppins, sans-serif`;
+      overlay.textBaseline = 'top';
+      overlay.fillText(txt, x, y);
+      overlay.restore();
+    }
+  }, []);
+
+  // ── History ────────────────────────────────────────────────────────────────
+
+  function saveHistory() {
+    const pixels = Array.from(pixelCanvases.current.entries()).map(([id, c]) => ({
+      id,
+      data: c.getContext('2d')!.getImageData(0, 0, W, H),
+    }));
+    const snap = { pixels, objects: [...objectsRef.current] };
+    history.current = history.current.slice(0, histIdx.current + 1);
+    history.current.push(snap);
+    histIdx.current++;
+  }
+
+  function applyHistoryEntry(entry: typeof history.current[0]) {
+    entry.pixels.forEach(({ id, data }) => {
+      const c = pixelCanvases.current.get(id);
+      if (c) c.getContext('2d')!.putImageData(data, 0, 0);
+    });
+    const objs = entry.objects;
+    objectsRef.current = objs;
+    setObjects(objs);
+    setSelectedId(null);
+    renderAll(layersRef.current, objs, null);
+  }
+
+  const undo = useCallback(() => {
+    if (histIdx.current <= 0) return;
+    histIdx.current--;
+    applyHistoryEntry(history.current[histIdx.current]);
+  }, []);
+
+  const redo = useCallback(() => {
+    if (histIdx.current >= history.current.length - 1) return;
+    histIdx.current++;
+    applyHistoryEntry(history.current[histIdx.current]);
+  }, []);
+
+  // ── Pointer → canvas coords ────────────────────────────────────────────────
+
+  function getPos(e: React.MouseEvent | MouseEvent): { x: number; y: number } {
+    const rect = overlayRef.current!.getBoundingClientRect();
+    const scaleX = W / rect.width;
+    const scaleY = H / rect.height;
+    return {
+      x: ((e as MouseEvent).clientX - rect.left) * scaleX,
+      y: ((e as MouseEvent).clientY - rect.top) * scaleY,
+    };
+  }
+
+  /** Get the composite of all layers up to (and including) targetLayerId, for flood fill reading */
+  function getCompositeCtx(targetLayerId: string): CanvasRenderingContext2D {
+    const tc = getTempCanvas('__fill_composite__');
+    if (!tempCanvases.current.has('__fill_composite__')) {
+      tc.width = W; tc.height = H;
+      tempCanvases.current.set('__fill_composite__', tc);
+    }
+    const ctx = tc.getContext('2d')!;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, W, H);
+    for (const layer of layersRef.current) {
+      if (!layer.visible) continue;
+      const pc = pixelCanvases.current.get(layer.id);
+      if (pc) {
+        ctx.drawImage(pc, 0, 0);
+        objectsRef.current
+          .filter((o) => o.layerId === layer.id)
+          .forEach((o) => drawObj(ctx, o, imageCache.current));
+      }
+      if (layer.id === targetLayerId) break;
+    }
+    return ctx;
+  }
+
+  // ── Mouse event handlers ───────────────────────────────────────────────────
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    const pos = getPos(e);
+    const t = toolRef.current;
+    const al = activeLayerRef.current;
+    drawing.current = true;
+    startPos.current = pos;
+    lastPos.current = pos;
+
+    if (t === 'select') {
+      // Check handles first (on selected object)
+      const sel = selectedIdRef.current
+        ? objectsRef.current.find((o) => o.id === selectedIdRef.current)
+        : null;
+
+      if (sel) {
+        const h = handleAt(sel, pos.x, pos.y);
+        if (h) {
+          saveHistory();
+          dragMode.current = 'resize';
+          dragHandle.current = h;
+          dragOrigObj.current = { ...sel };
+          return;
+        }
+      }
+
+      // Hit test all objects (topmost first)
+      const objs = [...objectsRef.current].reverse();
+      const hit = objs.find((o) => hitTest(o, pos.x, pos.y));
+      if (hit) {
+        if (hit.id !== selectedIdRef.current) {
+          setSelectedId(hit.id);
+          selectedIdRef.current = hit.id;
+        }
+        saveHistory();
+        dragMode.current = 'move';
+        dragOrigObj.current = { ...hit };
+        renderAll(layersRef.current, objectsRef.current, hit.id);
+      } else {
+        setSelectedId(null);
+        selectedIdRef.current = null;
+        renderAll(layersRef.current, objectsRef.current, null);
+      }
+      return;
+    }
+
+    if (!al) return;
+    const pc = pixelCanvases.current.get(al);
+    if (!pc) return;
+    const ctx = pc.getContext('2d')!;
+
+    if (t === 'fill') {
+      saveHistory();
+      const compCtx = getCompositeCtx(al);
+      floodFill(compCtx, ctx, pos.x, pos.y, colorRef.current, opacityRef.current);
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      drawing.current = false;
+      return;
+    }
+
+    if (t === 'text') {
+      const fSize = fontSizeRef.current;
+      const txt = textInputRef.current || 'Text';
+      const dims = measureText(txt, fSize);
+      saveHistory();
+      const newObj: PaintObj = {
+        id: uid(), layerId: al, type: 'text',
+        x: pos.x, y: pos.y, w: dims.w, h: dims.h,
+        opacity: opacityRef.current,
+        text: txt, fontSize: fSize, color: colorRef.current,
+      };
+      const next = [...objectsRef.current, newObj];
+      objectsRef.current = next;
+      setObjects(next);
+      setSelectedId(newObj.id);
+      selectedIdRef.current = newObj.id;
+      setTool('select');
+      toolRef.current = 'select';
+      renderAll(layersRef.current, next, newObj.id);
+      drawing.current = false;
+      return;
+    }
+
+    if (t === 'pencil' || t === 'eraser') {
+      saveHistory();
+      strokePoints.current = [pos];
+      ctx.globalAlpha = opacityRef.current;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = t === 'eraser' ? brushSizeRef.current * 3 : brushSizeRef.current;
+      ctx.globalCompositeOperation = t === 'eraser' ? 'destination-out' : 'source-over';
+      ctx.strokeStyle = colorRef.current;
+      ctx.beginPath();
+      ctx.moveTo(pos.x, pos.y);
+      ctx.lineTo(pos.x + 0.1, pos.y + 0.1);
+      ctx.stroke();
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
+    }
+
+    // Shape creation begins — save snapshot for live preview
+    if (t === 'line' || t === 'rect' || t === 'ellipse') {
+      saveHistory();
+      pixelSnapshot.current = pc.getContext('2d')!.getImageData(0, 0, W, H);
+    }
+  }, [renderAll]);
+
+  const onMouseMove = useCallback((e: React.MouseEvent) => {
+    const pos = getPos(e);
+    const t = toolRef.current;
+
+    // Text cursor preview
+    if (t === 'text') {
+      cursorPos.current = pos;
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
+    }
+
+    if (!drawing.current) {
+      // Update cursor style for handles
+      if (t === 'select') {
+        const sel = selectedIdRef.current
+          ? objectsRef.current.find((o) => o.id === selectedIdRef.current)
+          : null;
+        const canvas = overlayRef.current;
+        if (canvas) {
+          if (sel && handleAt(sel, pos.x, pos.y)) canvas.style.cursor = 'crosshair';
+          else if (objectsRef.current.find((o) => hitTest(o, pos.x, pos.y))) canvas.style.cursor = 'move';
+          else canvas.style.cursor = 'default';
+        }
+      }
+      return;
+    }
+
+    const al = activeLayerRef.current;
+
+    if (t === 'select') {
+      const selId = selectedIdRef.current;
+      if (!selId || !dragMode.current) return;
+      const dx = pos.x - (lastPos.current?.x ?? pos.x);
+      const dy = pos.y - (lastPos.current?.y ?? pos.y);
+      lastPos.current = pos;
+
+      const objs = objectsRef.current.map((o) => {
+        if (o.id !== selId) return o;
+        if (dragMode.current === 'move') return { ...o, x: o.x + dx, y: o.y + dy };
+        if (dragMode.current === 'resize' && dragHandle.current) {
+          return applyResize(o, dragHandle.current, dx, dy);
+        }
+        return o;
+      });
+      objectsRef.current = objs;
+      renderAll(layersRef.current, objs, selId);
+      return;
+    }
+
+    if (!al) return;
+    const pc = pixelCanvases.current.get(al);
+    if (!pc) return;
+    const ctx = pc.getContext('2d')!;
+
+    if (t === 'pencil' || t === 'eraser') {
+      strokePoints.current.push(pos);
+      ctx.lineTo(pos.x, pos.y);
+      ctx.stroke();
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+    } else if ((t === 'line' || t === 'rect' || t === 'ellipse') && startPos.current) {
+      const x = startPos.current.x;
+      const y = startPos.current.y;
+      const w = pos.x - x;
+      const h = pos.y - y;
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current, { type: t, x, y, w, h });
+    }
+    lastPos.current = pos;
+  }, [renderAll]);
+
+  const onMouseUp = useCallback((e: React.MouseEvent) => {
+    if (!drawing.current) return;
+    drawing.current = false;
+    const pos = getPos(e);
+    const t = toolRef.current;
+    const al = activeLayerRef.current;
+
+    if (t === 'select') {
+      if (dragMode.current) {
+        const objs = objectsRef.current.map(normBounds);
+        objectsRef.current = objs;
+        setObjects(objs);
+        dragMode.current = null;
+        dragHandle.current = null;
+        renderAll(layersRef.current, objs, selectedIdRef.current);
+      }
+      return;
+    }
+
+    if (!al) return;
+    const pc = pixelCanvases.current.get(al);
+    if (!pc) return;
+    const ctx = pc.getContext('2d')!;
+
+    if (t === 'pencil' || t === 'eraser') {
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    if ((t === 'line' || t === 'rect' || t === 'ellipse') && startPos.current) {
+      const x = startPos.current.x;
+      const y = startPos.current.y;
+      let w = pos.x - x;
+      let h = pos.y - y;
+
+      if (Math.abs(w) < 3 && Math.abs(h) < 3) {
+        pixelSnapshot.current = null;
+        renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+        return;
+      }
+
+      const newObj: PaintObj = {
+        id: uid(), layerId: al, type: t,
+        x, y, w, h,
+        opacity: opacityRef.current,
+        strokeColor: colorRef.current,
+        strokeWidth: brushSizeRef.current,
+      };
+      const next = normBounds(newObj.type === 'line' ? newObj : newObj);
+      const objs = [...objectsRef.current, next];
+      objectsRef.current = objs;
+      setObjects(objs);
+      setSelectedId(next.id);
+      selectedIdRef.current = next.id;
+      setTool('select');
+      toolRef.current = 'select';
+      pixelSnapshot.current = null;
+      renderAll(layersRef.current, objs, next.id);
+    }
+  }, [renderAll]);
+
+  // ── Layer management ────────────────────────────────────────────────────────
+
+  function makePixelCanvas() {
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    return c;
+  }
+
+  const addLayer = useCallback(() => {
+    const id = uid();
+    pixelCanvases.current.set(id, makePixelCanvas());
+    const layer: Layer = { id, name: `Layer ${layersRef.current.length + 1}`, visible: true, opacity: 1, blendMode: 'source-over' };
+    const next = [...layersRef.current, layer];
+    setLayers(next);
+    setActiveLayerId(id);
+  }, []);
+
+  const deleteLayer = useCallback((id: string) => {
+    if (layersRef.current.length <= 1) return;
+    pixelCanvases.current.delete(id);
+    tempCanvases.current.delete(id);
+    const remaining = layersRef.current.filter((l) => l.id !== id);
+    setLayers(remaining);
+    if (activeLayerRef.current === id) setActiveLayerId(remaining[remaining.length - 1].id);
+    const objs = objectsRef.current.filter((o) => o.layerId !== id);
+    objectsRef.current = objs;
+    setObjects(objs);
+    if (selectedIdRef.current) {
+      const stillExists = objs.find((o) => o.id === selectedIdRef.current);
+      if (!stillExists) { setSelectedId(null); selectedIdRef.current = null; }
+    }
+  }, []);
+
+  const moveLayer = useCallback((id: string, dir: 1 | -1) => {
+    const idx = layersRef.current.findIndex((l) => l.id === id);
+    const ni = idx + dir;
+    if (ni < 0 || ni >= layersRef.current.length) return;
+    const next = [...layersRef.current];
+    [next[idx], next[ni]] = [next[ni], next[idx]];
+    setLayers(next);
+  }, []);
+
+  const updateLayer = useCallback((id: string, patch: Partial<Layer>) => {
+    setLayers((ls) => ls.map((l) => (l.id === id ? { ...l, ...patch } : l)));
+  }, []);
+
+  // ── Object management ───────────────────────────────────────────────────────
+
+  const deleteSelected = useCallback(() => {
+    const id = selectedIdRef.current;
+    if (!id) return;
+    saveHistory();
+    const objs = objectsRef.current.filter((o) => o.id !== id);
+    objectsRef.current = objs;
+    setObjects(objs);
+    setSelectedId(null);
+    selectedIdRef.current = null;
+    renderAll(layersRef.current, objs, null);
+  }, [renderAll]);
+
+  const updateSelectedObj = useCallback((patch: Partial<PaintObj>) => {
+    const id = selectedIdRef.current;
+    if (!id) return;
+    const objs = objectsRef.current.map((o) => (o.id === id ? { ...o, ...patch } : o));
+    objectsRef.current = objs;
+    setObjects(objs);
+    renderAll(layersRef.current, objs, id);
+  }, [renderAll]);
+
+  // ── Import image as object ─────────────────────────────────────────────────
+
+  const importImage = useCallback((file: File) => {
+    if (!activeLayerRef.current) return;
+    const src = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      imageCache.current.set(src, img);
+      const scale = Math.min(1, W / img.naturalWidth, H / img.naturalHeight);
+      const w = Math.round(img.naturalWidth * scale);
+      const h = Math.round(img.naturalHeight * scale);
+      const x = Math.round((W - w) / 2);
+      const y = Math.round((H - h) / 2);
+      saveHistory();
+      const newObj: PaintObj = {
+        id: uid(), layerId: activeLayerRef.current!, type: 'image',
+        x, y, w, h, opacity: 1, src,
+      };
+      const objs = [...objectsRef.current, newObj];
+      objectsRef.current = objs;
+      setObjects(objs);
+      setSelectedId(newObj.id);
+      selectedIdRef.current = newObj.id;
+      setTool('select');
+      toolRef.current = 'select';
+      renderAll(layersRef.current, objs, newObj.id);
+    };
+    img.src = src;
+  }, [renderAll]);
+
+  // ── Export / new ───────────────────────────────────────────────────────────
+
+  const exportPng = useCallback(() => {
+    if (!displayRef.current) return;
+    const a = document.createElement('a');
+    a.href = displayRef.current.toDataURL('image/png');
+    a.download = 'painting.png';
+    a.click();
+  }, []);
+
+  const newCanvas = useCallback(() => {
+    pixelCanvases.current.clear();
+    tempCanvases.current.clear();
+    history.current = [];
+    histIdx.current = -1;
+    const id = uid();
+    const pc = makePixelCanvas();
+    pc.getContext('2d')!.fillStyle = '#ffffff';
+    pc.getContext('2d')!.fillRect(0, 0, W, H);
+    pixelCanvases.current.set(id, pc);
+    const layer: Layer = { id, name: 'Layer 1', visible: true, opacity: 1, blendMode: 'source-over' };
+    objectsRef.current = [];
+    setObjects([]);
+    setSelectedId(null);
+    selectedIdRef.current = null;
+    setLayers([layer]);
+    setActiveLayerId(id);
+  }, []);
+
+  // ── Init + effects ─────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    const id = uid();
+    const pc = makePixelCanvas();
+    const pCtx = pc.getContext('2d')!;
+    pCtx.fillStyle = '#ffffff';
+    pCtx.fillRect(0, 0, W, H);
+    pixelCanvases.current.set(id, pc);
+    const layer: Layer = { id, name: 'Layer 1', visible: true, opacity: 1, blendMode: 'source-over' };
+    setLayers([layer]);
+    setActiveLayerId(id);
+    saveHistory();
+  }, []);
+
+  useEffect(() => {
+    renderAll(layers, objects, selectedId);
+  }, [layers, objects, selectedId, renderAll]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
+      if (e.key === 'Delete' || e.key === 'Backspace') deleteSelected();
+      if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo(); }
+      if (e.ctrlKey && e.key === 'y') { e.preventDefault(); redo(); }
+      if (e.key === 'Escape') { setSelectedId(null); selectedIdRef.current = null; renderAll(layersRef.current, objectsRef.current, null); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [deleteSelected, undo, redo, renderAll]);
+
+  // ── Selected object for sidebar display ────────────────────────────────────
+
+  const selObj = objects.find((o) => o.id === selectedId) ?? null;
+
+  const TOOLS: { id: Tool; label: string; icon: string }[] = [
+    { id: 'select', label: 'Select', icon: '↖' },
+    { id: 'pencil', label: 'Pencil', icon: '✏️' },
+    { id: 'eraser', label: 'Eraser', icon: '🧹' },
+    { id: 'fill', label: 'Fill', icon: '🪣' },
+    { id: 'line', label: 'Line', icon: '╱' },
+    { id: 'rect', label: 'Rect', icon: '▭' },
+    { id: 'ellipse', label: 'Ellipse', icon: '◯' },
+    { id: 'text', label: 'Text', icon: 'T' },
+  ];
+
+  const BLENDS: BlendMode[] = ['source-over', 'multiply', 'screen', 'overlay'];
+
+  // ── JSX ────────────────────────────────────────────────────────────────────
+
+  return (
+    <div style={{ maxWidth: 1340, margin: '0 auto' }}>
+      {/* Top bar */}
+      <div style={{ border: '3px solid #000', background: '#fff', padding: '8px 12px', marginBottom: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', boxShadow: '4px 4px 0 #000' }}>
+        <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 20 }}>🖌️ Paint</strong>
+        <button style={S.smallBtn()} onClick={newCanvas}>New</button>
+        <label style={{ ...S.smallBtn(), cursor: 'pointer' }}>
+          Add image
+          <input type='file' accept='image/*' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && importImage(e.target.files[0])} />
+        </label>
+        <button style={S.smallBtn()} onClick={exportPng}>⬇ PNG</button>
+        <span style={{ width: 1, background: '#000', height: 20, display: 'inline-block', margin: '0 4px' }} />
+        <button style={S.smallBtn()} onClick={undo} title='Ctrl+Z'>↩ Undo</button>
+        <button style={S.smallBtn()} onClick={redo} title='Ctrl+Y'>↪ Redo</button>
+        {selectedId && (
+          <button style={S.smallBtn('#f44', '#fff')} onClick={deleteSelected}>
+            ✕ Delete selected
+          </button>
+        )}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '158px 1fr 192px', gap: 8, alignItems: 'start' }}>
+
+        {/* ── Left panel: tools + drawing options ─────────────────────────── */}
+        <div style={{ ...S.panel, display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <p style={{ ...S.label, marginBottom: 6 }}>TOOLS</p>
+          {TOOLS.map((t) => (
+            <button key={t.id} style={S.toolBtn(tool === t.id)} onClick={() => {
+              setTool(t.id);
+              if (t.id !== 'text') cursorPos.current = null;
+              renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+            }}>
+              {t.icon} {t.label}
+            </button>
+          ))}
+
+          <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
+
+          {/* Contextual options — selected object vs drawing */}
+          {selObj ? (
+            <>
+              <p style={{ ...S.label, color: '#0088ff' }}>SELECTED: {selObj.type.toUpperCase()}</p>
+
+              {(selObj.type === 'rect' || selObj.type === 'ellipse' || selObj.type === 'line') && (
+                <>
+                  <label style={S.label}>Stroke color</label>
+                  <input type='color' value={selObj.strokeColor ?? '#000000'}
+                    onChange={(e) => updateSelectedObj({ strokeColor: e.target.value })}
+                    style={{ width: '100%', height: 30, border: '2px solid #000', padding: 0, cursor: 'pointer', marginBottom: 4 }} />
+                  <label style={S.label}>Stroke width: {selObj.strokeWidth ?? 2}px</label>
+                  <input type='range' min={1} max={30} value={selObj.strokeWidth ?? 2}
+                    onChange={(e) => updateSelectedObj({ strokeWidth: parseInt(e.target.value) })}
+                    style={{ width: '100%' }} />
+                </>
+              )}
+
+              {selObj.type === 'text' && (
+                <>
+                  <label style={S.label}>Text</label>
+                  <input style={S.input} value={selObj.text ?? ''}
+                    onChange={(e) => {
+                      const dims = measureText(e.target.value, selObj.fontSize ?? 24);
+                      updateSelectedObj({ text: e.target.value, w: dims.w, h: dims.h });
+                    }} />
+                  <label style={S.label}>Color</label>
+                  <input type='color' value={selObj.color ?? '#000000'}
+                    onChange={(e) => updateSelectedObj({ color: e.target.value })}
+                    style={{ width: '100%', height: 30, border: '2px solid #000', padding: 0, cursor: 'pointer', marginBottom: 4 }} />
+                  <label style={S.label}>Font size: {selObj.fontSize ?? 24}px</label>
+                  <input type='range' min={8} max={200} value={selObj.fontSize ?? 24}
+                    onChange={(e) => {
+                      const fz = parseInt(e.target.value);
+                      const dims = measureText(selObj.text ?? '', fz);
+                      updateSelectedObj({ fontSize: fz, w: dims.w, h: dims.h });
+                    }}
+                    style={{ width: '100%' }} />
+                </>
+              )}
+
+              <label style={{ ...S.label, marginTop: 6 }}>Opacity: {Math.round((selObj.opacity ?? 1) * 100)}%</label>
+              <input type='range' min={0} max={100} value={Math.round((selObj.opacity ?? 1) * 100)}
+                onChange={(e) => updateSelectedObj({ opacity: parseInt(e.target.value) / 100 })}
+                style={{ width: '100%' }} />
+            </>
+          ) : (
+            <>
+              <label style={S.label}>Color</label>
+              <input type='color' value={color} onChange={(e) => setColor(e.target.value)}
+                style={{ width: '100%', height: 30, border: '2px solid #000', padding: 0, cursor: 'pointer', marginBottom: 4 }} />
+
+              <label style={{ ...S.label, marginTop: 4 }}>Size: {brushSize}px</label>
+              <input type='range' min={1} max={60} value={brushSize}
+                onChange={(e) => setBrushSize(parseInt(e.target.value))}
+                style={{ width: '100%' }} />
+
+              <label style={{ ...S.label, marginTop: 4 }}>Opacity: {Math.round(opacity * 100)}%</label>
+              <input type='range' min={0} max={100} value={Math.round(opacity * 100)}
+                onChange={(e) => setOpacity(parseInt(e.target.value) / 100)}
+                style={{ width: '100%' }} />
+
+              {tool === 'text' && (
+                <>
+                  <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
+                  <label style={S.label}>Text to place</label>
+                  <input style={S.input} value={textInput} onChange={(e) => setTextInput(e.target.value)} placeholder='Enter text…' />
+                  <label style={S.label}>Font size: {fontSize}px</label>
+                  <input type='range' min={8} max={200} value={fontSize}
+                    onChange={(e) => setFontSize(parseInt(e.target.value))}
+                    style={{ width: '100%', marginBottom: 6 }} />
+                  {/* Live font preview */}
+                  <div style={{ border: '1px dashed #999', padding: 6, background: '#fafafa', minHeight: 40, overflow: 'hidden' }}>
+                    <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: Math.min(fontSize, 48), color, lineHeight: 1.2, display: 'block', whiteSpace: 'pre' }}>
+                      {textInput || 'Preview'}
+                    </span>
+                  </div>
+                </>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* ── Center: canvas ───────────────────────────────────────────────── */}
+        <div style={{ position: 'relative', lineHeight: 0, border: '3px solid #000', boxShadow: '5px 5px 0 #000' }}>
+          {/* Display (composite) */}
+          <canvas ref={displayRef} width={W} height={H}
+            style={{ display: 'block', width: '100%', pointerEvents: 'none' }} />
+          {/* Overlay (events, selection, preview) */}
+          <canvas ref={overlayRef} width={W} height={H}
+            style={{ display: 'block', width: '100%', position: 'absolute', top: 0, left: 0, cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : 'crosshair' }}
+            onMouseDown={onMouseDown}
+            onMouseMove={onMouseMove}
+            onMouseUp={onMouseUp}
+            onMouseLeave={() => {
+              cursorPos.current = null;
+              if (drawing.current) {
+                drawing.current = false;
+                dragMode.current = null;
+                renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+              } else {
+                renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+              }
+            }}
+          />
+        </div>
+
+        {/* ── Right: layers panel ──────────────────────────────────────────── */}
+        <div style={S.panel}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <p style={S.label}>LAYERS</p>
+            <button style={S.smallBtn('#000', '#fff')} onClick={addLayer}>+ Add</button>
+          </div>
+
+          {[...layers].reverse().map((layer) => (
+            <div
+              key={layer.id}
+              onClick={() => setActiveLayerId(layer.id)}
+              style={{ border: `2px solid ${activeLayerId === layer.id ? '#000' : '#ccc'}`, background: activeLayerId === layer.id ? '#f0f0f0' : '#fff', padding: '6px 8px', marginBottom: 4, cursor: 'pointer' }}
+            >
+              <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 4 }}>
+                <button
+                  style={{ ...S.smallBtn(layer.visible ? '#000' : '#eee', layer.visible ? '#fff' : '#000'), fontSize: 10, padding: '1px 4px' }}
+                  onClick={(e) => { e.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}
+                >
+                  {layer.visible ? '👁' : '○'}
+                </button>
+                <input
+                  value={layer.name}
+                  onChange={(e) => updateLayer(layer.id, { name: e.target.value })}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ border: 'none', background: 'transparent', fontSize: 11, fontFamily: 'Poppins, sans-serif', fontWeight: 700, flex: 1, padding: 0 }}
+                />
+              </div>
+              <div style={{ display: 'flex', gap: 3 }}>
+                <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 1); }}>↑</button>
+                <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, -1); }}>↓</button>
+                <button style={S.smallBtn('#f44', '#fff')} onClick={(e) => { e.stopPropagation(); deleteLayer(layer.id); }}>✕</button>
+              </div>
+              <div style={{ marginTop: 4 }}>
+                <label style={{ ...S.label, fontSize: 9 }}>Opacity: {Math.round(layer.opacity * 100)}%</label>
+                <input type='range' min={0} max={100} value={Math.round(layer.opacity * 100)}
+                  onChange={(e) => { e.stopPropagation(); updateLayer(layer.id, { opacity: parseInt(e.target.value) / 100 }); }}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ width: '100%' }} />
+              </div>
+              <div style={{ marginTop: 4 }}>
+                <label style={{ ...S.label, fontSize: 9 }}>Blend</label>
+                <select
+                  value={layer.blendMode}
+                  onChange={(e) => { updateLayer(layer.id, { blendMode: e.target.value as BlendMode }); }}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ width: '100%', border: '1px solid #000', fontSize: 10, fontFamily: 'Poppins, sans-serif' }}
+                >
+                  {BLENDS.map((b) => <option key={b} value={b}>{b}</option>)}
+                </select>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}

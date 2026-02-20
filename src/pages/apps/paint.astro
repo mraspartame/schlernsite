@@ -1,0 +1,17 @@
+---
+import Layout from '@layouts/Default.astro';
+import PaintEditor from '../../components/apps/PaintEditor';
+---
+
+<Layout
+  title='Paint'
+  pageTitle='Schlern | Paint'
+  description='A browser-based paint app with layer support — draw, add shapes, text, and more.'
+>
+  <main class='bg-pink p-4' style='min-height: calc(100vh - 80px);'>
+    <div class='mb-3'>
+      <a href='/apps/' class='poppins font-bold hover:underline'>&larr; All Apps</a>
+    </div>
+    <PaintEditor client:only='react' />
+  </main>
+</Layout>

@@ -1,0 +1,17 @@
+---
+import Layout from '@layouts/Default.astro';
+import AudioTools from '../../components/apps/AudioTools';
+---
+
+<Layout
+  title='Audio Tools'
+  pageTitle='Schlern | Audio Tools'
+  description='Mic tester and audio trimmer — record and play back your microphone, or trim audio files.'
+>
+  <main class='bg-yellow p-6'>
+    <div class='mb-4'>
+      <a href='/apps/' class='poppins font-bold hover:underline'>&larr; All Apps</a>
+    </div>
+    <AudioTools client:only='react' />
+  </main>
+</Layout>

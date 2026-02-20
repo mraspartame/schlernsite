@@ -1,0 +1,17 @@
+---
+import Layout from '@layouts/Default.astro';
+import ImageConverter from '../../components/apps/ImageConverter';
+---
+
+<Layout
+  title='Image Converter'
+  pageTitle='Schlern | Image Converter'
+  description='Convert and resize images between PNG, JPEG, and WebP — all in the browser.'
+>
+  <main class='bg-green p-6'>
+    <div class='mb-4'>
+      <a href='/apps/' class='poppins font-bold hover:underline'>&larr; All Apps</a>
+    </div>
+    <ImageConverter client:only='react' />
+  </main>
+</Layout>

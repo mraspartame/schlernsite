@@ -1,0 +1,17 @@
+---
+import Layout from '@layouts/Default.astro';
+import ExpenseSplitter from '../../components/apps/ExpenseSplitter';
+---
+
+<Layout
+  title='Expense Splitter'
+  pageTitle='Schlern | Expense Splitter'
+  description='Split group expenses fairly by days present. Share the breakdown via URL.'
+>
+  <main class='bg-blue p-6'>
+    <div class='mb-4'>
+      <a href='/apps/' class='poppins font-bold hover:underline'>&larr; All Apps</a>
+    </div>
+    <ExpenseSplitter client:only='react' />
+  </main>
+</Layout>

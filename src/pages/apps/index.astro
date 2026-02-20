@@ -1,0 +1,99 @@
+---
+import Layout from '@layouts/Default.astro';
+import { Card, Button } from '@eliancodes/brutal-ui';
+
+const apps = [
+  {
+    slug: 'paint',
+    name: 'Paint',
+    description:
+      'A browser-based paint app with layer support. Draw, add shapes, text, and stamps — like MS Paint but with layers.',
+    color: 'bg-pink',
+    emoji: '🖌️',
+  },
+  {
+    slug: 'pdf',
+    name: 'PDF Editor',
+    description:
+      'View, annotate, and restructure PDFs. Reorder pages, add or remove pages, and draw markup — all in the browser.',
+    color: 'bg-orange',
+    emoji: '📄',
+  },
+  {
+    slug: 'color',
+    name: 'Color Editor',
+    description:
+      'Color-grade your photos with brightness, contrast, saturation, hue rotation, curves, and per-channel adjustments.',
+    color: 'bg-purple',
+    emoji: '🎨',
+  },
+  {
+    slug: 'converter',
+    name: 'Image Converter',
+    description:
+      'Convert images between PNG, JPEG, and WebP. Resize by pixel dimensions or percentage, control quality.',
+    color: 'bg-green',
+    emoji: '🖼️',
+  },
+  {
+    slug: 'audio',
+    name: 'Audio Tools',
+    description:
+      'Mic tester: hold a button, record, then play it back to hear yourself. Also includes an audio file trimmer.',
+    color: 'bg-yellow',
+    emoji: '🎙️',
+  },
+  {
+    slug: 'expense',
+    name: 'Expense Splitter',
+    description:
+      'Split group expenses like hotels and rental cars fairly by days present. Export or share via URL.',
+    color: 'bg-blue',
+    emoji: '💸',
+  },
+  {
+    slug: 'transfer',
+    name: 'P2P File Transfer',
+    description:
+      'Send files directly between two browsers, no install required. Exchange a short code and transfer up to a few GB.',
+    color: 'bg-pink',
+    emoji: '📡',
+  },
+];
+---
+
+<Layout
+  title='Apps'
+  pageTitle='Schlern | Apps'
+  description='Browser-based tools that run locally — no installs, no accounts.'
+>
+  <main class='bg-green p-6'>
+    <section class='mb-8'>
+      <Card>
+        <h1 class='dm-serif text-4xl md:text-6xl mb-2'>Apps & Tools</h1>
+        <p class='poppins text-lg'>
+          Browser-based utilities that run entirely on your computer. No sign-in, no data sent anywhere.
+        </p>
+      </Card>
+    </section>
+
+    <div class='grid md:grid-cols-2 lg:grid-cols-3 gap-6'>
+      {
+        apps.map((app) => (
+          <a href={`/apps/${app.slug}/`} class='block card-shadow'>
+            <div class='border-4 border-black bg-white h-full flex flex-col'>
+              <div class={`border-b-4 border-black p-6 ${app.color}`}>
+                <span class='text-4xl'>{app.emoji}</span>
+              </div>
+              <div class='p-5 flex flex-col flex-1'>
+                <h2 class='dm-serif text-2xl mb-2'>{app.name}</h2>
+                <p class='poppins text-sm flex-1'>{app.description}</p>
+                <p class='poppins text-sm font-bold mt-4'>Open app &rarr;</p>
+              </div>
+            </div>
+          </a>
+        ))
+      }
+    </div>
+  </main>
+</Layout>

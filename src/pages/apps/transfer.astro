@@ -1,0 +1,17 @@
+---
+import Layout from '@layouts/Default.astro';
+import FileTransfer from '../../components/apps/FileTransfer';
+---
+
+<Layout
+  title='P2P File Transfer'
+  pageTitle='Schlern | P2P File Transfer'
+  description='Transfer files directly between two browsers using WebRTC — no server, no install, no size limit.'
+>
+  <main class='bg-pink p-6'>
+    <div class='mb-4'>
+      <a href='/apps/' class='poppins font-bold hover:underline'>&larr; All Apps</a>
+    </div>
+    <FileTransfer client:only='react' />
+  </main>
+</Layout>
