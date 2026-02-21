@@ -210,7 +210,7 @@ function floodFill(
 
   if (tr === fr && tg === fg && tb === fb && ta === fa) return;
 
-  const TOL = 20;
+  const TOL = 80;
   const matches = (i: number) =>
     Math.abs(rd[i] - tr) <= TOL &&
     Math.abs(rd[i + 1] - tg) <= TOL &&
