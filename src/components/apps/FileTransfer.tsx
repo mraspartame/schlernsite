@@ -1,9 +1,9 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useCallback } from 'react';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type Mode = 'choose' | 'send' | 'receive';
-type ConnectionState = 'idle' | 'waiting' | 'connecting' | 'connected' | 'transferring' | 'done' | 'error';
+type ConnectionState = 'idle' | 'connecting' | 'connected' | 'transferring' | 'done' | 'error';
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
@@ -14,7 +14,6 @@ const S = {
   label: { display: 'block', fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 13, marginBottom: 4 } as React.CSSProperties,
   p: { fontFamily: 'Poppins, sans-serif', fontSize: 14, marginBottom: 8 } as React.CSSProperties,
   code: { fontFamily: 'monospace', background: '#f0f0f0', border: '1px solid #ccc', padding: '12px 16px', display: 'block', fontSize: 13, wordBreak: 'break-all' as const, whiteSpace: 'pre-wrap' as const, maxHeight: 200, overflowY: 'auto' as const } as React.CSSProperties,
-  input: { border: '2px solid #000', padding: '8px 12px', fontFamily: 'Poppins, sans-serif', fontSize: 14, width: '100%', boxSizing: 'border-box' as const, marginBottom: 8 },
   textarea: { border: '2px solid #000', padding: '8px 12px', fontFamily: 'monospace', fontSize: 12, width: '100%', boxSizing: 'border-box' as const, height: 100, marginBottom: 8, resize: 'vertical' as const },
   btn: (bg = '#000', fg = '#fff', disabled = false) => ({
     border: '2px solid #000', background: disabled ? '#ccc' : bg, color: disabled ? '#888' : fg,
@@ -35,12 +34,21 @@ async function loadPeer(): Promise<typeof import('peerjs').Peer> {
   return Peer;
 }
 
+// ── Progress bar ──────────────────────────────────────────────────────────────
+
+function ProgressBar({ pct }: { pct: number }) {
+  return (
+    <div style={{ border: '2px solid #000', height: 24, background: '#eee', position: 'relative', marginTop: 8 }}>
+      <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${pct}%`, background: '#000', transition: 'width 0.2s' }} />
+    </div>
+  );
+}
+
 // ── Send side ─────────────────────────────────────────────────────────────────
+// Flow: paste receiver's code → connect → pick file → send
 
 function Sender({ onBack }: { onBack: () => void }) {
   const [state, setState] = useState<ConnectionState>('idle');
-  const [myId, setMyId] = useState('');
-  const [offer, setOffer] = useState('');
   const [receiveCode, setReceiveCode] = useState('');
   const [file, setFile] = useState<File | null>(null);
   const [progress, setProgress] = useState(0);
@@ -49,34 +57,22 @@ function Sender({ onBack }: { onBack: () => void }) {
   const peerRef = useRef<any>(null);
   const connRef = useRef<any>(null);
 
-  const start = useCallback(async () => {
-    setState('waiting');
+  const connect = async () => {
+    if (!receiveCode.trim()) return;
+    setState('connecting');
     setError('');
     try {
+      const info = JSON.parse(atob(receiveCode.trim()));
       const Peer = await loadPeer();
       const peer = new Peer();
       peerRef.current = peer;
-      peer.on('open', (id: string) => {
-        setMyId(id);
-        // Encode the full connection info as a compact code
-        setOffer(btoa(JSON.stringify({ id, type: 'send' })));
+      peer.on('open', () => {
+        const conn = peer.connect(info.id, { reliable: true });
+        connRef.current = conn;
+        conn.on('open', () => setState('connected'));
+        conn.on('error', (e: any) => { setError(String(e)); setState('error'); });
       });
-      peer.on('error', (e: any) => setError(String(e)));
-    } catch (e: any) {
-      setError(String(e));
-      setState('error');
-    }
-  }, []);
-
-  const connectToReceiver = async () => {
-    if (!peerRef.current || !receiveCode.trim()) return;
-    setState('connecting');
-    try {
-      const info = JSON.parse(atob(receiveCode.trim()));
-      const conn = peerRef.current.connect(info.id, { reliable: true });
-      connRef.current = conn;
-      conn.on('open', () => setState('connected'));
-      conn.on('error', (e: any) => { setError(String(e)); setState('error'); });
+      peer.on('error', (e: any) => { setError(String(e)); setState('error'); });
     } catch (e: any) {
       setError('Invalid code: ' + String(e));
       setState('error');
@@ -86,78 +82,58 @@ function Sender({ onBack }: { onBack: () => void }) {
   const sendFile = async () => {
     if (!file || !connRef.current) return;
     setState('transferring');
-    const CHUNK = 64 * 1024; // 64 KB chunks
+    const CHUNK = 64 * 1024;
     const buf = await file.arrayBuffer();
     const total = buf.byteLength;
 
-    // Send metadata first
     connRef.current.send(JSON.stringify({ type: 'meta', name: file.name, size: total, mime: file.type }));
 
-    // Send chunks
     for (let offset = 0; offset < total; offset += CHUNK) {
       connRef.current.send(buf.slice(offset, offset + CHUNK));
       setProgress(Math.min(100, Math.round(((offset + CHUNK) / total) * 100)));
-      await new Promise((r) => setTimeout(r, 1));
+      // Yield to avoid blocking — gives browser time to flush the send buffer
+      await new Promise((r) => setTimeout(r, 5));
     }
 
     connRef.current.send(JSON.stringify({ type: 'done' }));
     setState('done');
   };
 
-  const copyCode = () => navigator.clipboard.writeText(offer);
-
   return (
     <div>
       <button style={S.btn('#fff', '#000')} onClick={onBack}>← Back</button>
       <h2 style={S.h2}>📤 Send a File</h2>
 
-      {state === 'idle' && (
-        <button style={S.btn()} onClick={start}>Start (generate your code)</button>
-      )}
-
-      {(state === 'waiting' || state === 'connecting' || state === 'connected') && offer && (
+      {(state === 'idle' || state === 'connecting') && (
         <div style={S.card}>
-          <p style={S.label}>Step 1: Share your code with the receiver</p>
-          <code style={S.code}>{offer}</code>
-          <button style={S.btn()} onClick={copyCode}>Copy code</button>
-        </div>
-      )}
-
-      {state === 'waiting' && (
-        <div style={S.card}>
-          <p style={S.label}>Step 2: Paste the receiver's code here</p>
+          <p style={S.label}>Paste the receiver's code here</p>
           <textarea
             style={S.textarea}
             value={receiveCode}
             onChange={(e) => setReceiveCode(e.target.value)}
             placeholder='Paste the code the receiver gave you…'
+            disabled={state === 'connecting'}
           />
-          <button style={S.btn()} onClick={connectToReceiver} disabled={!receiveCode.trim()}>
-            Connect
+          <button style={S.btn()} onClick={connect} disabled={!receiveCode.trim() || state === 'connecting'}>
+            {state === 'connecting' ? 'Connecting…' : 'Connect'}
           </button>
         </div>
       )}
 
-      {state === 'connecting' && <p style={S.p}>Connecting…</p>}
-
       {state === 'connected' && (
         <div style={S.card}>
           <p style={{ ...S.p, color: '#0a0', fontWeight: 700 }}>✓ Connected!</p>
-          <p style={S.label}>Step 3: Select the file to send</p>
+          <p style={S.label}>Select the file to send</p>
           <input type='file' onChange={(e) => setFile(e.target.files?.[0] ?? null)} style={{ marginBottom: 10 }} />
           {file && <p style={S.p}>{file.name} — {(file.size / 1024 / 1024).toFixed(2)} MB</p>}
-          <button style={S.btn()} onClick={sendFile} disabled={!file}>
-            Send file
-          </button>
+          <button style={S.btn()} onClick={sendFile} disabled={!file}>Send file</button>
         </div>
       )}
 
       {state === 'transferring' && (
         <div style={S.card}>
           <p style={S.p}>Sending… {progress}%</p>
-          <div style={{ border: '2px solid #000', height: 24, background: '#eee', position: 'relative' }}>
-            <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${progress}%`, background: '#000', transition: 'width 0.2s' }} />
-          </div>
+          <ProgressBar pct={progress} />
         </div>
       )}
 
@@ -168,11 +144,11 @@ function Sender({ onBack }: { onBack: () => void }) {
 }
 
 // ── Receive side ──────────────────────────────────────────────────────────────
+// Flow: start → share code → wait for sender to connect → file arrives automatically
 
 function Receiver({ onBack }: { onBack: () => void }) {
   const [state, setState] = useState<ConnectionState>('idle');
   const [myCode, setMyCode] = useState('');
-  const [senderCode, setSenderCode] = useState('');
   const [fileName, setFileName] = useState('');
   const [fileSize, setFileSize] = useState(0);
   const [received, setReceived] = useState(0);
@@ -184,56 +160,53 @@ function Receiver({ onBack }: { onBack: () => void }) {
   const metaRef = useRef<{ name: string; size: number; mime: string } | null>(null);
 
   const start = useCallback(async () => {
-    setState('waiting');
+    setState('connecting');
     setError('');
     try {
       const Peer = await loadPeer();
       const peer = new Peer();
       peerRef.current = peer;
+
       peer.on('open', (id: string) => {
-        setMyCode(btoa(JSON.stringify({ id, type: 'receive' })));
+        setMyCode(btoa(JSON.stringify({ id })));
+        setState('connected'); // "connected" here means "listening / waiting for sender"
       });
+
+      // This is the key fix: listen for the sender connecting TO us
+      peer.on('connection', (conn: any) => {
+        conn.on('data', (data: any) => {
+          if (typeof data === 'string') {
+            try {
+              const msg = JSON.parse(data);
+              if (msg.type === 'meta') {
+                metaRef.current = { name: msg.name, size: msg.size, mime: msg.mime };
+                setFileName(msg.name);
+                setFileSize(msg.size);
+                chunksRef.current = [];
+                setReceived(0);
+                setState('transferring');
+              } else if (msg.type === 'done') {
+                const blob = new Blob(chunksRef.current, { type: metaRef.current?.mime ?? 'application/octet-stream' });
+                setDownloadUrl(URL.createObjectURL(blob));
+                setState('done');
+              }
+            } catch { /* ignore non-JSON strings */ }
+          } else {
+            // Binary chunk — handle both ArrayBuffer and Uint8Array
+            const chunk = data instanceof ArrayBuffer ? data : (data as Uint8Array).buffer.slice(0) as ArrayBuffer;
+            chunksRef.current.push(chunk);
+            setReceived((prev) => prev + chunk.byteLength);
+          }
+        });
+        conn.on('error', (e: any) => { setError(String(e)); setState('error'); });
+      });
+
       peer.on('error', (e: any) => { setError(String(e)); setState('error'); });
     } catch (e: any) {
       setError(String(e));
       setState('error');
     }
   }, []);
-
-  const connectToSender = async () => {
-    if (!peerRef.current || !senderCode.trim()) return;
-    setState('connecting');
-    try {
-      const info = JSON.parse(atob(senderCode.trim()));
-      const conn = peerRef.current.connect(info.id, { reliable: true });
-      conn.on('open', () => setState('connected'));
-      conn.on('data', (data: any) => {
-        if (typeof data === 'string') {
-          const msg = JSON.parse(data);
-          if (msg.type === 'meta') {
-            metaRef.current = { name: msg.name, size: msg.size, mime: msg.mime };
-            setFileName(msg.name);
-            setFileSize(msg.size);
-            chunksRef.current = [];
-            setReceived(0);
-            setState('transferring');
-          } else if (msg.type === 'done') {
-            const blob = new Blob(chunksRef.current, { type: metaRef.current?.mime ?? 'application/octet-stream' });
-            setDownloadUrl(URL.createObjectURL(blob));
-            setState('done');
-          }
-        } else if (data instanceof ArrayBuffer) {
-          chunksRef.current.push(data);
-          const totalReceived = chunksRef.current.reduce((s, c) => s + c.byteLength, 0);
-          setReceived(totalReceived);
-        }
-      });
-      conn.on('error', (e: any) => { setError(String(e)); setState('error'); });
-    } catch (e: any) {
-      setError('Invalid code: ' + String(e));
-      setState('error');
-    }
-  };
 
   const copyCode = () => navigator.clipboard.writeText(myCode);
   const progress = fileSize > 0 ? Math.min(100, Math.round((received / fileSize) * 100)) : 0;
@@ -247,45 +220,34 @@ function Receiver({ onBack }: { onBack: () => void }) {
         <button style={S.btn()} onClick={start}>Start (generate your code)</button>
       )}
 
-      {(state === 'waiting' || state === 'connecting' || state === 'connected') && myCode && (
+      {state === 'connecting' && <p style={S.p}>Initialising…</p>}
+
+      {(state === 'connected' || state === 'transferring') && myCode && (
         <div style={S.card}>
-          <p style={S.label}>Step 1: Share your code with the sender</p>
+          <p style={S.label}>Share this code with the sender</p>
           <code style={S.code}>{myCode}</code>
           <button style={S.btn()} onClick={copyCode}>Copy code</button>
+          {state === 'connected' && (
+            <p style={{ ...S.p, color: '#555', marginTop: 8, marginBottom: 0 }}>Waiting for sender to connect…</p>
+          )}
         </div>
       )}
-
-      {state === 'waiting' && (
-        <div style={S.card}>
-          <p style={S.label}>Step 2: Paste the sender's code here</p>
-          <textarea
-            style={S.textarea}
-            value={senderCode}
-            onChange={(e) => setSenderCode(e.target.value)}
-            placeholder='Paste the code the sender gave you…'
-          />
-          <button style={S.btn()} onClick={connectToSender} disabled={!senderCode.trim()}>
-            Connect
-          </button>
-        </div>
-      )}
-
-      {state === 'connecting' && <p style={S.p}>Connecting…</p>}
-      {state === 'connected' && <p style={{ ...S.p, color: '#0a0', fontWeight: 700 }}>✓ Connected! Waiting for sender to start…</p>}
 
       {state === 'transferring' && (
         <div style={S.card}>
-          <p style={S.p}>Receiving {fileName}… {progress}% ({(received / 1024 / 1024).toFixed(2)} / {(fileSize / 1024 / 1024).toFixed(2)} MB)</p>
-          <div style={{ border: '2px solid #000', height: 24, background: '#eee', position: 'relative' }}>
-            <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${progress}%`, background: '#000', transition: 'width 0.2s' }} />
-          </div>
+          <p style={S.p}>
+            Receiving {fileName}… {progress}%
+            {fileSize > 0 && ` (${(received / 1024 / 1024).toFixed(2)} / ${(fileSize / 1024 / 1024).toFixed(2)} MB)`}
+          </p>
+          <ProgressBar pct={progress} />
         </div>
       )}
 
       {state === 'done' && (
         <div style={S.card}>
           <p style={{ ...S.p, color: '#0a0', fontWeight: 700 }}>✓ Transfer complete!</p>
-          <a href={downloadUrl} download={fileName} style={{ ...S.btn('#000', '#fff'), textDecoration: 'none', display: 'inline-block' }}>
+          <a href={downloadUrl} download={fileName}
+            style={{ ...S.btn('#000', '#fff'), textDecoration: 'none', display: 'inline-block' }}>
             ⬇ Download {fileName}
           </a>
         </div>
@@ -310,7 +272,8 @@ export default function FileTransfer() {
           Both people need this page open at the same time.
         </p>
         <p style={S.p}>
-          <strong>How it works:</strong> Both sides generate a short code. Exchange codes (via chat, call, etc.), and a direct peer-to-peer connection is established. Then the sender picks a file and sends it.
+          <strong>How it works:</strong> The receiver generates a code and shares it with the sender.
+          The sender pastes the code to connect, then picks a file to send.
         </p>
       </div>
 
