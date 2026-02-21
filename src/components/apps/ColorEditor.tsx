@@ -171,12 +171,26 @@ function Slider({ label, value, min, max, step = 1, onChange }: {
   );
 }
 
+// ── TIFF loader via UTIF.js (CDN) ─────────────────────────────────────────────
+
+function loadUtif(): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if ((window as any).UTIF) return resolve((window as any).UTIF);
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.js';
+    script.onload = () => resolve((window as any).UTIF);
+    script.onerror = () => reject(new Error('Failed to load UTIF.js'));
+    document.head.appendChild(script);
+  });
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ColorEditor() {
   const [file, setFile] = useState<File | null>(null);
   const [adj, setAdj] = useState<Adjustments>(defaultAdj);
   const [rendering, setRendering] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const originalRef = useRef<ImageData | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -195,20 +209,55 @@ export default function ColorEditor() {
     }, 30);
   }, []);
 
-  const loadFile = (f: File) => {
-    if (!f.type.startsWith('image/')) return;
+  const loadFile = async (f: File) => {
+    const isTiff = f.type === 'image/tiff' || f.type === 'image/x-tiff' || /\.tiff?$/i.test(f.name);
+    if (!f.type.startsWith('image/') && !isTiff) return;
     setFile(f);
     setAdj(defaultAdj);
+    setLoadError(null);
+
+    if (isTiff) {
+      try {
+        const UTIF = await loadUtif();
+        const buf = await f.arrayBuffer();
+        const ifds = UTIF.decode(buf);
+        if (!ifds.length) throw new Error('No images found in TIFF');
+        UTIF.decodeImage(buf, ifds[0]);
+        const rgba = UTIF.toRGBA8(ifds[0]);
+        const srcW = ifds[0].width as number;
+        const srcH = ifds[0].height as number;
+
+        const maxW = 1200, maxH = 800;
+        const scale = Math.min(1, maxW / srcW, maxH / srcH);
+        const dw = Math.round(srcW * scale);
+        const dh = Math.round(srcH * scale);
+
+        if (canvasRef.current) {
+          // Paint raw RGBA onto a temp canvas, then scale-draw to the display canvas
+          const tmp = document.createElement('canvas');
+          tmp.width = srcW; tmp.height = srcH;
+          tmp.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(rgba), srcW, srcH), 0, 0);
+
+          canvasRef.current.width = dw;
+          canvasRef.current.height = dh;
+          const ctx = canvasRef.current.getContext('2d')!;
+          ctx.drawImage(tmp, 0, 0, dw, dh);
+          originalRef.current = ctx.getImageData(0, 0, dw, dh);
+        }
+      } catch (e: any) {
+        setLoadError('Failed to load TIFF: ' + (e.message ?? String(e)));
+      }
+      return;
+    }
+
     const url = URL.createObjectURL(f);
     const img = new Image();
     img.onload = () => {
       imgRef.current = img;
-      // Cap display size
       const maxW = 1200, maxH = 800;
       const scale = Math.min(1, maxW / img.naturalWidth, maxH / img.naturalHeight);
       const w = Math.round(img.naturalWidth * scale);
       const h = Math.round(img.naturalHeight * scale);
-
       if (canvasRef.current) {
         canvasRef.current.width = w;
         canvasRef.current.height = h;
@@ -218,6 +267,7 @@ export default function ColorEditor() {
       }
       URL.revokeObjectURL(url);
     };
+    img.onerror = () => setLoadError('Failed to load image. Try a different format.');
     img.src = url;
   };
 
@@ -236,7 +286,9 @@ export default function ColorEditor() {
 
   const download = () => {
     if (!canvasRef.current || !file) return;
-    const ext = file.name.match(/\.(jpe?g|png|webp)$/i)?.[1] ?? 'jpg';
+    const isTiff = /\.tiff?$/i.test(file.name);
+    // TIFF can't be written by canvas — save as PNG instead
+    const ext = isTiff ? 'png' : (file.name.match(/\.(jpe?g|png|webp)$/i)?.[1] ?? 'jpg');
     const type = ext.startsWith('j') ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : 'image/png';
     const a = document.createElement('a');
     a.href = canvasRef.current.toDataURL(type, 0.92);
@@ -258,11 +310,13 @@ export default function ColorEditor() {
           onClick={() => document.getElementById('color-input')?.click()}
           style={{ ...S.card, textAlign: 'center', padding: '60px 20px', cursor: 'pointer', minHeight: 200, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10 }}
         >
-          <input id='color-input' type='file' accept='image/*' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])} />
+          <input id='color-input' type='file' accept='image/*,.tif,.tiff' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])} />
           <span style={{ fontSize: 52 }}>📷</span>
           <p style={{ ...S.p, fontWeight: 700, fontSize: 16 }}>Drop an image here or click to open</p>
+          <p style={{ ...S.p, fontSize: 12, color: '#666' }}>JPEG · PNG · WebP · TIFF</p>
         </div>
       )}
+      {loadError && <p style={{ ...S.p, color: '#c00', marginBottom: 12 }}>{loadError}</p>}
 
       {file && (
         <div
@@ -297,7 +351,7 @@ export default function ColorEditor() {
               <button style={S.btn('#eee', '#000')} onClick={() => { document.getElementById('color-input')?.click(); }}>
                 📂 Open different image
               </button>
-              <input id='color-input' type='file' accept='image/*' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])} />
+              <input id='color-input' type='file' accept='image/*,.tif,.tiff' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])} />
             </div>
           </div>
 
