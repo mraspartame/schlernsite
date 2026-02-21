@@ -15,6 +15,8 @@ interface Expense {
   amount: number;
   paidBy: string;
   splitType: 'equal' | 'by-days';
+  startDay: number;
+  endDay: number;
 }
 
 interface State {
@@ -42,6 +44,10 @@ function decodeState(hash: string): State | null {
   }
 }
 
+function overlapDays(pStart: number, pEnd: number, eStart: number, eEnd: number): number {
+  return Math.max(0, Math.min(pEnd, eEnd) - Math.max(pStart, eStart) + 1);
+}
+
 function calcSplits(
   state: State
 ): { person: Person; owes: Record<string, number>; receives: Record<string, number> }[] {
@@ -53,22 +59,28 @@ function calcSplits(
   expenses.forEach((exp) => {
     const payer = exp.paidBy;
     const amount = exp.amount;
+    const eStart = exp.startDay;
+    const eEnd = exp.endDay;
+
+    // Only include people who were present on at least one day of this expense
+    const present = people.filter((p) => overlapDays(p.startDay, p.endDay, eStart, eEnd) > 0);
+    if (present.length === 0) return;
 
     if (exp.splitType === 'equal') {
-      const share = amount / people.length;
-      people.forEach((p) => {
+      const share = amount / present.length;
+      present.forEach((p) => {
         if (p.id !== payer) {
           net[p.id][payer] = (net[p.id][payer] ?? 0) + share;
           net[payer][p.id] = (net[payer][p.id] ?? 0) - share;
         }
       });
     } else {
-      // by-days: split proportionally to days each person was present
-      const totalDays = people.reduce((s, p) => s + Math.max(0, p.endDay - p.startDay + 1), 0);
-      if (totalDays === 0) return;
-      people.forEach((p) => {
-        const days = Math.max(0, p.endDay - p.startDay + 1);
-        const share = (days / totalDays) * amount;
+      // by-days: split proportionally to overlapping days between person and expense
+      const overlaps = present.map((p) => ({ p, days: overlapDays(p.startDay, p.endDay, eStart, eEnd) }));
+      const totalOverlap = overlaps.reduce((s, o) => s + o.days, 0);
+      if (totalOverlap === 0) return;
+      overlaps.forEach(({ p, days }) => {
+        const share = (days / totalOverlap) * amount;
         if (p.id !== payer) {
           net[p.id][payer] = (net[p.id][payer] ?? 0) + share;
           net[payer][p.id] = (net[payer][p.id] ?? 0) - share;
@@ -186,6 +198,8 @@ export default function ExpenseSplitter() {
           amount: 0,
           paidBy: state.people[0]?.id ?? '',
           splitType: 'by-days',
+          startDay: 1,
+          endDay: state.totalDays,
         },
       ],
     });
@@ -207,6 +221,30 @@ export default function ExpenseSplitter() {
     a.href = URL.createObjectURL(blob);
     a.download = `${state.title.replace(/\s+/g, '-').toLowerCase()}.json`;
     a.click();
+  };
+
+  const importJson = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target?.result as string) as State;
+        if (!data.title || !Array.isArray(data.people) || !Array.isArray(data.expenses)) {
+          alert('Invalid JSON: missing required fields.');
+          return;
+        }
+        // Migrate older exports that lack startDay/endDay on expenses
+        const totalDays = data.totalDays ?? 1;
+        data.expenses = data.expenses.map((exp) => ({
+          ...exp,
+          startDay: exp.startDay ?? 1,
+          endDay: exp.endDay ?? totalDays,
+        }));
+        setState(data);
+      } catch {
+        alert('Could not parse JSON file.');
+      }
+    };
+    reader.readAsText(file);
   };
 
   const splits = state.people.length > 0 ? calcSplits(state) : [];
@@ -248,6 +286,11 @@ export default function ExpenseSplitter() {
           <button style={S.btn('#fff', '#000')} onClick={exportJson}>
             ⬇ Export JSON
           </button>
+          <label style={{ ...S.btn('#fff', '#000'), cursor: 'pointer', boxShadow: '3px 3px 0 #000' }}>
+            ↑ Import JSON
+            <input type='file' accept='.json,application/json' style={{ display: 'none' }}
+              onChange={(e) => { if (e.target.files?.[0]) { importJson(e.target.files[0]); e.target.value = ''; } }} />
+          </label>
         </div>
       </div>
 
@@ -337,6 +380,26 @@ export default function ExpenseSplitter() {
                     ))}
                   </select>
                 </div>
+              </div>
+              {/* Day range */}
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 8, flexWrap: 'wrap' as const }}>
+                <label style={{ ...S.label, marginBottom: 0 }}>Days:</label>
+                <input
+                  style={{ ...S.input, width: 60, marginBottom: 0 }}
+                  type='number' min={1} max={state.totalDays}
+                  value={exp.startDay}
+                  onChange={(e) => updateExpense(exp.id, { startDay: Math.min(parseInt(e.target.value) || 1, exp.endDay) })}
+                />
+                <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 13 }}>–</span>
+                <input
+                  style={{ ...S.input, width: 60, marginBottom: 0 }}
+                  type='number' min={1} max={state.totalDays}
+                  value={exp.endDay}
+                  onChange={(e) => updateExpense(exp.id, { endDay: Math.max(parseInt(e.target.value) || 1, exp.startDay) })}
+                />
+                <span style={S.tag}>
+                  {state.people.filter((p) => overlapDays(p.startDay, p.endDay, exp.startDay, exp.endDay) > 0).length} of {state.people.length} people
+                </span>
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <label style={{ ...S.label, marginBottom: 0 }}>Split:</label>

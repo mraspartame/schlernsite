@@ -116,10 +116,18 @@ function MicTester() {
       analyserRef.current = analyser;
 
       const tick = () => {
-        const buf = new Uint8Array(analyser.frequencyBinCount);
-        analyser.getByteFrequencyData(buf);
-        const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
-        setLevel(Math.min(1, avg / 60));
+        const buf = new Uint8Array(analyser.fftSize);
+        analyser.getByteTimeDomainData(buf);
+        // Compute RMS of the waveform (each sample is 0–255, centre is 128)
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const v = (buf[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / buf.length);
+        // Map to 0–1 using a dB scale: -60 dB = 0, 0 dB = 1
+        const db = rms > 0.0001 ? 20 * Math.log10(rms) : -100;
+        setLevel(Math.max(0, Math.min(1, (db + 60) / 60)));
         animRef.current = requestAnimationFrame(tick);
       };
       tick();
@@ -170,7 +178,7 @@ function MicTester() {
       <div style={{ marginBottom: 16 }}>
         <label style={S.label}>Input level</label>
         <div style={{ border: '2px solid #000', height: 20, width: '100%', background: '#eee', position: 'relative' }}>
-          <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${level * 100}%`, background: level > 0.8 ? '#f00' : level > 0.5 ? '#fa0' : '#0a0', transition: 'width 0.05s' }} />
+          <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${level * 100}%`, background: level > 0.92 ? '#f00' : level > 0.78 ? '#fa0' : '#0a0', transition: 'width 0.05s' }} />
         </div>
       </div>
 
@@ -296,7 +304,7 @@ function AudioTrimmer() {
 
       <input
         type='file'
-        accept='audio/*'
+        accept='audio/*,.webm,video/webm'
         style={{ display: 'none' }}
         id='audio-input'
         onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])}
