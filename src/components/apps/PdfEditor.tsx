@@ -16,9 +16,9 @@ interface Annotation {
   type: AnnType;
   x: number; y: number; w: number; h: number;
   color: string;
-  opacity?: number;      // 0–1, for image annotations
-  lockAspect?: boolean;  // maintain aspect ratio on resize
-  naturalAr?: number;    // natural w/h ratio (set at creation time)
+  opacity?: number;
+  lockAspect?: boolean;
+  naturalAr?: number;
   text?: string;
   fontFamily?: string;
   imageSrc?: string;
@@ -30,7 +30,7 @@ const FONTS = [
   { label: 'Monospace', value: 'monospace' },
 ];
 
-const PAGE_GAP = 14; // px gap between pages in the multi-page canvas
+const PAGE_GAP = 14;
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
@@ -71,7 +71,6 @@ function handleAtPoint(ann: Annotation, px: number, py: number): string | null {
 
 function annHitTest(ann: Annotation, px: number, py: number): boolean {
   if (ann.type === 'rect') {
-    // Hit on the border (not just interior) for easier selection
     const bw = 6;
     return px >= ann.x - bw && px <= ann.x + ann.w + bw &&
            py >= ann.y - bw && py <= ann.y + ann.h + bw;
@@ -98,13 +97,15 @@ export default function PdfEditor() {
   const [viewScale, setViewScale] = useState(1);
 
   const pdfDocRef = useRef<any>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayRef = useRef<HTMLCanvasElement>(null);
+  // Per-page canvas refs — populated via callback refs in JSX
+  const pageCanvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const pageOverlayRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const pageDivRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<File | null>(null);
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
-  /** Per-page layout in the combined multi-page canvas: { y, w, h } */
-  const pageLayouts = useRef<Map<string, { y: number; w: number; h: number }>>(new Map());
+  // Cancellation token: increments on each renderAllPages call
+  const renderCountRef = useRef(0);
 
   // Refs for event handlers
   const annotationsRef = useRef(annotations);   annotationsRef.current = annotations;
@@ -120,9 +121,10 @@ export default function PdfEditor() {
     mode: 'create-rect' | 'move' | 'resize' | null;
     handle: string | null;
     startX: number; startY: number;
+    startPageId: string | null;
     origAnn: Annotation | null;
     drawing: boolean;
-  }>({ mode: null, handle: null, startX: 0, startY: 0, origAnn: null, drawing: false });
+  }>({ mode: null, handle: null, startX: 0, startY: 0, startPageId: null, origAnn: null, drawing: false });
 
   // ── Load PDF.js (CDN, avoids bundler/worker issues) ──────────────────────
 
@@ -142,66 +144,61 @@ export default function PdfEditor() {
     });
   }, []);
 
-  // ── Draw annotations on overlay canvas (all pages with y-offsets) ─────────
-  // Must be declared before renderAllPages which calls it.
+  // ── Per-page overlay drawing ───────────────────────────────────────────────
 
-  const redrawOverlay = useCallback((
-    currentAnns: Annotation[],
-    currentSelId: string | null,
-  ) => {
-    if (!overlayRef.current) return;
-    const ctx = overlayRef.current.getContext('2d')!;
-    ctx.clearRect(0, 0, overlayRef.current.width, overlayRef.current.height);
+  const redrawPageOverlay = useCallback((pageId: string) => {
+    const overlay = pageOverlayRefs.current.get(pageId);
+    if (!overlay) return;
+    const ctx = overlay.getContext('2d')!;
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
 
-    for (const ann of currentAnns) {
-      const layout = pageLayouts.current.get(ann.pageId);
-      if (!layout) continue;
-      const oy = layout.y; // page y-offset in combined canvas
+    const anns = annotationsRef.current.filter((a) => a.pageId === pageId);
+    const selId = selectedAnnRef.current;
 
+    for (const ann of anns) {
       ctx.save();
       if (ann.type === 'rect') {
         ctx.globalAlpha = 0.35;
         ctx.fillStyle = ann.color;
-        ctx.fillRect(ann.x, ann.y + oy, ann.w, ann.h);
+        ctx.fillRect(ann.x, ann.y, ann.w, ann.h);
         ctx.globalAlpha = 1;
         ctx.strokeStyle = ann.color;
         ctx.lineWidth = 2;
-        ctx.strokeRect(ann.x, ann.y + oy, ann.w, ann.h);
+        ctx.strokeRect(ann.x, ann.y, ann.w, ann.h);
       } else if (ann.type === 'text' && ann.text) {
         const ff = ann.fontFamily ?? 'Poppins, sans-serif';
         ctx.font = `bold 16px ${ff}`;
         ctx.fillStyle = '#fff';
-        ctx.fillText(ann.text, ann.x + 1, ann.y + oy + 1);
+        ctx.fillText(ann.text, ann.x + 1, ann.y + 1);
         ctx.fillStyle = ann.color;
-        ctx.fillText(ann.text, ann.x, ann.y + oy);
+        ctx.fillText(ann.text, ann.x, ann.y);
       } else if (ann.type === 'image' && ann.imageSrc) {
         const img = imageCache.current.get(ann.imageSrc);
         if (img) {
           ctx.globalAlpha = ann.opacity ?? 1;
-          ctx.drawImage(img, ann.x, ann.y + oy, ann.w, ann.h);
+          ctx.drawImage(img, ann.x, ann.y, ann.w, ann.h);
           ctx.globalAlpha = 1;
           ctx.strokeStyle = '#000';
           ctx.lineWidth = 1;
-          ctx.strokeRect(ann.x, ann.y + oy, ann.w, ann.h);
+          ctx.strokeRect(ann.x, ann.y, ann.w, ann.h);
         }
       }
       ctx.restore();
 
-      // Draw selection handles
-      if (currentSelId === ann.id) {
+      if (selId === ann.id) {
         ctx.save();
         ctx.strokeStyle = '#0088ff';
         ctx.lineWidth = 2;
         ctx.setLineDash([5, 3]);
-        ctx.strokeRect(ann.x - 3, ann.y + oy - 3, ann.w + 6, ann.h + 6);
+        ctx.strokeRect(ann.x - 3, ann.y - 3, ann.w + 6, ann.h + 6);
         ctx.setLineDash([]);
         if (ann.type !== 'text') {
           ctx.fillStyle = '#fff';
           ctx.strokeStyle = '#0088ff';
           ctx.lineWidth = 1.5;
           for (const h of getHandlePositions(ann)) {
-            ctx.fillRect(h.x - 5, h.y + oy - 5, 10, 10);
-            ctx.strokeRect(h.x - 5, h.y + oy - 5, 10, 10);
+            ctx.fillRect(h.x - 5, h.y - 5, 10, 10);
+            ctx.strokeRect(h.x - 5, h.y - 5, 10, 10);
           }
         }
         ctx.restore();
@@ -209,68 +206,53 @@ export default function PdfEditor() {
     }
   }, []);
 
-  // ── Render all pages stacked vertically into a single canvas ─────────────
+  // ── Render one page to its canvas ─────────────────────────────────────────
 
-  const renderAllPages = useCallback(async (pagesArg: PageEntry[], scale: number) => {
+  const renderOnePage = useCallback(async (entry: PageEntry, scale: number) => {
     const doc = pdfDocRef.current;
-    if (!doc || !canvasRef.current || !overlayRef.current) return;
+    if (!doc) return;
+    const canvas = pageCanvasRefs.current.get(entry.id);
+    const overlay = pageOverlayRefs.current.get(entry.id);
+    if (!canvas || !overlay) return;
 
-    let totalH = PAGE_GAP;
-    let maxW = 0;
-    const layouts = new Map<string, { y: number; w: number; h: number }>();
-
-    // First pass: measure dimensions of every page
-    for (const entry of pagesArg) {
+    try {
       let pw: number, ph: number;
       if (entry.pageNum < 1) {
         pw = Math.round(595 * scale); ph = Math.round(842 * scale);
+        canvas.width = pw; canvas.height = ph;
+        const ctx = canvas.getContext('2d')!;
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, pw, ph);
       } else {
         const page = await doc.getPage(entry.pageNum);
         const vp = page.getViewport({ scale });
         pw = Math.round(vp.width); ph = Math.round(vp.height);
+        canvas.width = pw; canvas.height = ph;
+        await page.render({ canvasContext: canvas.getContext('2d')!, viewport: vp }).promise;
       }
-      layouts.set(entry.id, { y: totalH, w: pw, h: ph });
-      totalH += ph + PAGE_GAP;
-      maxW = Math.max(maxW, pw);
+      overlay.width = pw; overlay.height = ph;
+      redrawPageOverlay(entry.id);
+    } catch (err) {
+      console.error(`Failed to render page ${entry.pageNum}:`, err);
     }
+  }, [redrawPageOverlay]);
 
-    pageLayouts.current = layouts;
-    const cW = maxW, cH = totalH;
-    canvasRef.current.width = cW;
-    canvasRef.current.height = cH;
-    overlayRef.current.width = cW;
-    overlayRef.current.height = cH;
-
-    const ctx = canvasRef.current.getContext('2d')!;
-    ctx.fillStyle = '#777';
-    ctx.fillRect(0, 0, cW, cH);
-
-    // Second pass: render each page
+  const renderAllPages = useCallback(async (pagesArg: PageEntry[], scale: number) => {
+    const myCount = ++renderCountRef.current;
     for (const entry of pagesArg) {
-      const layout = layouts.get(entry.id)!;
-      if (entry.pageNum < 1) {
-        ctx.fillStyle = '#fff';
-        ctx.fillRect(0, layout.y, layout.w, layout.h);
-      } else {
-        const page = await doc.getPage(entry.pageNum);
-        const vp = page.getViewport({ scale });
-        const tmp = document.createElement('canvas');
-        tmp.width = vp.width; tmp.height = vp.height;
-        await page.render({ canvasContext: tmp.getContext('2d')!, viewport: vp }).promise;
-        ctx.drawImage(tmp, 0, layout.y);
-      }
+      if (renderCountRef.current !== myCount) return; // cancelled by newer call
+      await renderOnePage(entry, scale);
     }
+  }, [renderOnePage]);
 
-    // Redraw annotation overlay after pages render
-    redrawOverlay(annotationsRef.current, selectedAnnRef.current);
-  }, [redrawOverlay]);
-
-  // Sync overlay whenever annotations or selection changes
+  // Sync overlays when annotations or selection changes
   useEffect(() => {
-    redrawOverlay(annotations, selectedAnnId);
-  }, [annotations, selectedAnnId, redrawOverlay]);
+    for (const pageId of pageOverlayRefs.current.keys()) {
+      redrawPageOverlay(pageId);
+    }
+  }, [annotations, selectedAnnId, redrawPageOverlay]);
 
-  // Re-render all pages when page list or zoom changes
+  // Re-render pages when page list or zoom changes
   useEffect(() => {
     if (pdfDocRef.current && pages.length > 0) {
       renderAllPages(pages, viewScale);
@@ -288,6 +270,9 @@ export default function PdfEditor() {
     setAnnotations([]);
     setSelectedAnnId(null);
     fileRef.current = file;
+    pageCanvasRefs.current.clear();
+    pageOverlayRefs.current.clear();
+    pageDivRefs.current.clear();
 
     try {
       const pdfjsLib = await loadPdfjsLib();
@@ -307,10 +292,7 @@ export default function PdfEditor() {
       }
 
       setPages(entries);
-      if (entries.length > 0) {
-        setActivePage(entries[0].id);
-        renderPage(1, pdf);
-      }
+      if (entries.length > 0) setActivePage(entries[0].id);
     } catch (e: any) {
       setError('Failed to load PDF: ' + (e.message ?? String(e)));
     } finally {
@@ -318,20 +300,35 @@ export default function PdfEditor() {
     }
   };
 
-  // ── Overlay canvas coords ─────────────────────────────────────────────────
+  // ── Overlay canvas helpers ─────────────────────────────────────────────────
 
+  /** Canvas-local coords from a mousedown on a per-page overlay (uses e.currentTarget). */
   function getOverlayPos(e: React.MouseEvent): { x: number; y: number } {
-    const rect = overlayRef.current!.getBoundingClientRect();
-    const sx = overlayRef.current!.width / rect.width;
-    const sy = overlayRef.current!.height / rect.height;
+    const canvas = e.currentTarget as HTMLCanvasElement;
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width;
+    const sy = canvas.height / rect.height;
     return { x: (e.clientX - rect.left) * sx, y: (e.clientY - rect.top) * sy };
   }
 
-  // ── Overlay mouse events ──────────────────────────────────────────────────
+  /** Canvas-local coords relative to a specific page overlay (used during drag). */
+  function getPosByPage(e: React.MouseEvent, pageId: string): { x: number; y: number } | null {
+    const overlay = pageOverlayRefs.current.get(pageId);
+    if (!overlay) return null;
+    const rect = overlay.getBoundingClientRect();
+    const sx = overlay.width / rect.width;
+    const sy = overlay.height / rect.height;
+    return { x: (e.clientX - rect.left) * sx, y: (e.clientY - rect.top) * sy };
+  }
 
-  const onOverlayDown = (e: React.MouseEvent) => {
-    if (!activePageRef.current) return;
+  // ── Per-page mousedown ────────────────────────────────────────────────────
+
+  const onOverlayDown = (e: React.MouseEvent, pageId: string) => {
     const pos = getOverlayPos(e);
+    if (pageId !== activePageRef.current) {
+      setActivePage(pageId);
+      activePageRef.current = pageId;
+    }
     const t = toolRef.current;
     const ia = interactRef.current;
 
@@ -339,9 +336,9 @@ export default function PdfEditor() {
       const txt = textInputRef.current || prompt('Enter annotation text:', '') || '';
       if (!txt) return;
       const newAnn: Annotation = {
-        id: uid(), pageId: activePageRef.current, type: 'text',
+        id: uid(), pageId, type: 'text',
         x: pos.x, y: pos.y, w: txt.length * 9, h: 20,
-        color: colorRef.current, text: txt,
+        color: colorRef.current, text: txt, fontFamily: annFontRef.current,
       };
       const next = [...annotationsRef.current, newAnn];
       annotationsRef.current = next;
@@ -352,32 +349,25 @@ export default function PdfEditor() {
     }
 
     if (t === 'select') {
-      const pageAnns = annotationsRef.current.filter((a) => a.pageId === activePageRef.current);
-
-      // Check handles first
+      const pageAnns = annotationsRef.current.filter((a) => a.pageId === pageId);
       const selId = selectedAnnRef.current;
       const selAnn = selId ? pageAnns.find((a) => a.id === selId) : null;
       if (selAnn && selAnn.type !== 'text') {
         const h = handleAtPoint(selAnn, pos.x, pos.y);
         if (h) {
-          ia.mode = 'resize';
-          ia.handle = h;
+          ia.mode = 'resize'; ia.handle = h;
           ia.startX = pos.x; ia.startY = pos.y;
-          ia.origAnn = { ...selAnn };
-          ia.drawing = true;
+          ia.origAnn = { ...selAnn }; ia.drawing = true;
           return;
         }
       }
-
-      // Hit test annotations (topmost first)
       const hit = [...pageAnns].reverse().find((a) => annHitTest(a, pos.x, pos.y));
       if (hit) {
         setSelectedAnnId(hit.id);
         selectedAnnRef.current = hit.id;
         ia.mode = 'move';
         ia.startX = pos.x; ia.startY = pos.y;
-        ia.origAnn = { ...hit };
-        ia.drawing = true;
+        ia.origAnn = { ...hit }; ia.drawing = true;
       } else {
         setSelectedAnnId(null);
         selectedAnnRef.current = null;
@@ -388,33 +378,36 @@ export default function PdfEditor() {
     if (t === 'rect') {
       ia.mode = 'create-rect';
       ia.startX = pos.x; ia.startY = pos.y;
-      ia.drawing = true;
+      ia.startPageId = pageId; ia.drawing = true;
     }
   };
 
-  const onOverlayMove = (e: React.MouseEvent) => {
+  // ── Container-level move/up (captures drags that leave a page overlay) ────
+
+  const onContainerMove = (e: React.MouseEvent) => {
     const ia = interactRef.current;
-    if (!ia.drawing || !activePageRef.current) return;
-    const pos = getOverlayPos(e);
+    if (!ia.drawing) return;
+    const pageId = ia.mode === 'create-rect' ? ia.startPageId : (ia.origAnn?.pageId ?? null);
+    if (!pageId) return;
+    const pos = getPosByPage(e, pageId);
+    if (!pos) return;
 
     if (ia.mode === 'create-rect') {
       const x = Math.min(ia.startX, pos.x);
       const y = Math.min(ia.startY, pos.y);
       const w = Math.abs(pos.x - ia.startX);
       const h = Math.abs(pos.y - ia.startY);
-      // Show live preview
-      const currentAnns = annotationsRef.current;
-      redrawOverlay(currentAnns, selectedAnnRef.current, activePageRef.current);
-      const ctx = overlayRef.current!.getContext('2d')!;
-      ctx.save();
-      ctx.globalAlpha = 0.3;
-      ctx.fillStyle = colorRef.current;
-      ctx.fillRect(x, y, w, h);
-      ctx.globalAlpha = 1;
-      ctx.strokeStyle = colorRef.current;
-      ctx.lineWidth = 2;
-      ctx.strokeRect(x, y, w, h);
-      ctx.restore();
+      redrawPageOverlay(pageId);
+      const overlay = pageOverlayRefs.current.get(pageId);
+      if (overlay) {
+        const ctx = overlay.getContext('2d')!;
+        ctx.save();
+        ctx.globalAlpha = 0.3; ctx.fillStyle = colorRef.current;
+        ctx.fillRect(x, y, w, h);
+        ctx.globalAlpha = 1; ctx.strokeStyle = colorRef.current; ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, w, h);
+        ctx.restore();
+      }
       return;
     }
 
@@ -422,12 +415,10 @@ export default function PdfEditor() {
       const dx = pos.x - ia.startX;
       const dy = pos.y - ia.startY;
       const orig = ia.origAnn;
-
       let updated: Annotation;
       if (ia.mode === 'move') {
         updated = { ...orig, x: orig.x + dx, y: orig.y + dy };
       } else {
-        // Resize via corner handles
         updated = { ...orig };
         switch (ia.handle) {
           case 'nw': updated.x = orig.x + dx; updated.y = orig.y + dy; updated.w = orig.w - dx; updated.h = orig.h - dy; break;
@@ -435,10 +426,8 @@ export default function PdfEditor() {
           case 'se': updated.w = orig.w + dx; updated.h = orig.h + dy; break;
           case 'sw': updated.x = orig.x + dx; updated.w = orig.w - dx; updated.h = orig.h + dy; break;
         }
-        // Clamp to minimum size
         if (updated.w < 10) { updated.w = 10; if (ia.handle?.includes('w')) updated.x = orig.x + orig.w - 10; }
         if (updated.h < 10) { updated.h = 10; if (ia.handle?.includes('n')) updated.y = orig.y + orig.h - 10; }
-        // Aspect ratio constraint
         if (orig.lockAspect && orig.naturalAr) {
           const ar = orig.naturalAr;
           const h = ia.handle;
@@ -449,42 +438,39 @@ export default function PdfEditor() {
           }
         }
       }
-
-      const next = annotationsRef.current.map((a) =>
-        a.id === updated.id ? updated : a,
-      );
+      const next = annotationsRef.current.map((a) => a.id === updated.id ? updated : a);
       annotationsRef.current = next;
       setAnnotations(next);
     }
   };
 
-  const onOverlayUp = (e: React.MouseEvent) => {
+  const onContainerUp = (e: React.MouseEvent) => {
     const ia = interactRef.current;
-    if (!ia.drawing || !activePageRef.current) return;
-    const pos = getOverlayPos(e);
+    if (!ia.drawing) return;
 
-    if (ia.mode === 'create-rect') {
-      const w = Math.abs(pos.x - ia.startX);
-      const h = Math.abs(pos.y - ia.startY);
-      if (w > 5 && h > 5) {
-        const newAnn: Annotation = {
-          id: uid(), pageId: activePageRef.current, type: 'rect',
-          x: Math.min(ia.startX, pos.x), y: Math.min(ia.startY, pos.y), w, h,
-          color: colorRef.current,
-        };
-        const next = [...annotationsRef.current, newAnn];
-        annotationsRef.current = next;
-        setAnnotations(next);
-        setSelectedAnnId(newAnn.id);
-        selectedAnnRef.current = newAnn.id;
-        setTool('select');
+    if (ia.mode === 'create-rect' && ia.startPageId) {
+      const pos = getPosByPage(e, ia.startPageId);
+      if (pos) {
+        const w = Math.abs(pos.x - ia.startX);
+        const h = Math.abs(pos.y - ia.startY);
+        if (w > 5 && h > 5) {
+          const newAnn: Annotation = {
+            id: uid(), pageId: ia.startPageId, type: 'rect',
+            x: Math.min(ia.startX, pos.x), y: Math.min(ia.startY, pos.y),
+            w, h, color: colorRef.current,
+          };
+          const next = [...annotationsRef.current, newAnn];
+          annotationsRef.current = next;
+          setAnnotations(next);
+          setSelectedAnnId(newAnn.id);
+          selectedAnnRef.current = newAnn.id;
+          setTool('select');
+        }
       }
     }
 
-    ia.drawing = false;
-    ia.mode = null;
-    ia.handle = null;
-    ia.origAnn = null;
+    ia.drawing = false; ia.mode = null; ia.handle = null;
+    ia.origAnn = null; ia.startPageId = null;
   };
 
   // ── Image annotation ──────────────────────────────────────────────────────
@@ -495,16 +481,12 @@ export default function PdfEditor() {
     const img = new Image();
     img.onload = () => {
       imageCache.current.set(src, img);
-      // Default size: fit within 300×300
       const scale = Math.min(1, 300 / img.naturalWidth, 300 / img.naturalHeight);
       const w = Math.round(img.naturalWidth * scale);
       const h = Math.round(img.naturalHeight * scale);
       const newAnn: Annotation = {
         id: uid(), pageId: activePage, type: 'image',
-        x: 20, y: 20, w, h,
-        color: '#000', imageSrc: src,
-        opacity: 1,
-        naturalAr: w / h,
+        x: 20, y: 20, w, h, color: '#000', imageSrc: src, opacity: 1, naturalAr: w / h,
       };
       const next = [...annotations, newAnn];
       annotationsRef.current = next;
@@ -550,6 +532,12 @@ export default function PdfEditor() {
     setSelectedAnnId(null);
   };
 
+  const scrollToPage = (pageId: string) => {
+    const el = pageDivRefs.current.get(pageId);
+    if (!el || !scrollContainerRef.current) return;
+    scrollContainerRef.current.scrollTop = Math.max(0, el.offsetTop - 20);
+  };
+
   const deleteSelectedAnnotation = () => {
     if (!selectedAnnId) return;
     const next = annotations.filter((a) => a.id !== selectedAnnId);
@@ -579,7 +567,6 @@ export default function PdfEditor() {
         }
       }
 
-      // Embed annotations as image layers
       for (let i = 0; i < pages.length; i++) {
         const entry = pages[i];
         const pageAnns = annotations.filter((a) => a.pageId === entry.id);
@@ -607,11 +594,10 @@ export default function PdfEditor() {
             ctx.fillStyle = ann.color;
             ctx.fillRect(ann.x * scaleX, ann.y * scaleY, ann.w * scaleX, ann.h * scaleY);
             ctx.globalAlpha = 1;
-            ctx.strokeStyle = ann.color;
-            ctx.lineWidth = 2;
+            ctx.strokeStyle = ann.color; ctx.lineWidth = 2;
             ctx.strokeRect(ann.x * scaleX, ann.y * scaleY, ann.w * scaleX, ann.h * scaleY);
           } else if (ann.type === 'text' && ann.text) {
-            ctx.font = `bold ${16 * SCALE}px sans-serif`;
+            ctx.font = `bold ${16 * SCALE}px ${ann.fontFamily ?? 'sans-serif'}`;
             ctx.fillStyle = ann.color;
             ctx.fillText(ann.text, ann.x * scaleX, ann.y * scaleY);
           } else if (ann.type === 'image' && ann.imageSrc) {
@@ -644,7 +630,7 @@ export default function PdfEditor() {
     }
   };
 
-  // ── Selected annotation for property panel ────────────────────────────────
+  // ── Selected annotation property panel ────────────────────────────────────
 
   const selAnn = annotations.find((a) => a.id === selectedAnnId) ?? null;
 
@@ -669,6 +655,12 @@ export default function PdfEditor() {
 
   // ── Render ────────────────────────────────────────────────────────────────
 
+  const overlayStyle = (pageId: string): React.CSSProperties => ({
+    position: 'absolute', top: 0, left: 0,
+    cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : 'crosshair',
+    outline: activePage === pageId ? '2px solid #0088ff' : 'none',
+  });
+
   return (
     <div style={{ maxWidth: 1400, margin: '0 auto' }}>
       {/* Header */}
@@ -678,7 +670,8 @@ export default function PdfEditor() {
         <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
           <label style={{ ...S.btn(), cursor: 'pointer', display: 'inline-block' }}>
             📂 Open PDF
-            <input type='file' accept='application/pdf' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && loadPdf(e.target.files[0])} />
+            <input type='file' accept='application/pdf' style={{ display: 'none' }}
+              onChange={(e) => e.target.files?.[0] && loadPdf(e.target.files[0])} />
           </label>
           {pages.length > 0 && (
             <>
@@ -701,9 +694,8 @@ export default function PdfEditor() {
             <h2 style={S.h2}>Pages ({pages.length})</h2>
             <div style={{ maxHeight: '70vh', overflowY: 'auto' }}>
               {pages.map((p, idx) => (
-                <div
-                  key={p.id}
-                  onClick={() => setActivePage(p.id)}
+                <div key={p.id}
+                  onClick={() => { setActivePage(p.id); scrollToPage(p.id); }}
                   style={{ border: `2px solid ${activePage === p.id ? '#000' : '#ddd'}`, background: activePage === p.id ? '#eee' : '#fff', padding: 6, marginBottom: 6, cursor: 'pointer' }}
                 >
                   <p style={{ ...S.label, marginBottom: 4 }}>Page {idx + 1}</p>
@@ -724,7 +716,7 @@ export default function PdfEditor() {
             </div>
           </div>
 
-          {/* Main canvas */}
+          {/* Main canvas area */}
           <div>
             {/* Annotation toolbar */}
             <div style={{ ...S.card, padding: 10, marginBottom: 8 }}>
@@ -738,14 +730,21 @@ export default function PdfEditor() {
                 <input type='color' value={annColor} onChange={(e) => setAnnColor(e.target.value)}
                   style={{ width: 32, height: 28, border: '2px solid #000', cursor: 'pointer', padding: 0 }} title='Color' />
                 {tool === 'text' && (
-                  <input value={textInput} onChange={(e) => setTextInput(e.target.value)}
-                    placeholder='Text to add…'
-                    style={{ border: '2px solid #000', padding: '4px 8px', fontSize: 12, fontFamily: 'Poppins, sans-serif' }} />
+                  <>
+                    <input value={textInput} onChange={(e) => setTextInput(e.target.value)}
+                      placeholder='Text to add…'
+                      style={{ border: '2px solid #000', padding: '4px 8px', fontSize: 12, fontFamily: 'Poppins, sans-serif' }} />
+                    <select value={annFont} onChange={(e) => setAnnFont(e.target.value)}
+                      style={{ border: '2px solid #000', padding: '4px 6px', fontSize: 12, fontFamily: 'Poppins, sans-serif', cursor: 'pointer' }}>
+                      {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                    </select>
+                  </>
                 )}
                 {tool === 'image' && (
                   <label style={{ ...S.btn('#fff', '#000'), cursor: 'pointer' }}>
                     Choose image…
-                    <input type='file' accept='image/*' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && addImageAnnotation(e.target.files[0])} />
+                    <input type='file' accept='image/*' style={{ display: 'none' }}
+                      onChange={(e) => e.target.files?.[0] && addImageAnnotation(e.target.files[0])} />
                   </label>
                 )}
                 <span style={{ marginLeft: 'auto', fontFamily: 'Poppins, sans-serif', fontSize: 11 }}>
@@ -766,17 +765,30 @@ export default function PdfEditor() {
               )}
             </div>
 
-            {/* Canvas */}
-            <div style={{ border: '3px solid #000', background: '#888', overflow: 'auto', maxHeight: '75vh', boxShadow: '5px 5px 0 #000' }}>
-              <div style={{ display: 'block', position: 'relative', margin: '12px auto', width: 'fit-content' }}>
-                <canvas ref={canvasRef} style={{ display: 'block' }} />
-                <canvas
-                  ref={overlayRef}
-                  style={{ position: 'absolute', top: 0, left: 0, cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : 'crosshair' }}
-                  onMouseDown={onOverlayDown}
-                  onMouseMove={onOverlayMove}
-                  onMouseUp={onOverlayUp}
-                />
+            {/* Scrollable per-page canvas stack */}
+            <div ref={scrollContainerRef}
+              style={{ border: '3px solid #000', background: '#888', overflow: 'auto', maxHeight: '75vh', boxShadow: '5px 5px 0 #000', userSelect: 'none' }}
+              onMouseMove={onContainerMove}
+              onMouseUp={onContainerUp}
+              onMouseLeave={onContainerUp}
+            >
+              <div style={{ padding: `${PAGE_GAP}px 12px` }}>
+                {pages.map((p) => (
+                  <div key={p.id}
+                    ref={(el) => { if (el) pageDivRefs.current.set(p.id, el); else pageDivRefs.current.delete(p.id); }}
+                    style={{ margin: `0 auto ${PAGE_GAP}px`, width: 'fit-content', position: 'relative' }}
+                  >
+                    <canvas
+                      ref={(el) => { if (el) pageCanvasRefs.current.set(p.id, el); else pageCanvasRefs.current.delete(p.id); }}
+                      style={{ display: 'block' }}
+                    />
+                    <canvas
+                      ref={(el) => { if (el) pageOverlayRefs.current.set(p.id, el); else pageOverlayRefs.current.delete(p.id); }}
+                      style={overlayStyle(p.id)}
+                      onMouseDown={(e) => onOverlayDown(e, p.id)}
+                    />
+                  </div>
+                ))}
               </div>
             </div>
           </div>
@@ -784,7 +796,6 @@ export default function PdfEditor() {
           {/* Properties panel */}
           <div style={S.card}>
             <h2 style={S.h2}>Properties</h2>
-
             {selAnn ? (
               <>
                 <p style={{ ...S.label, color: '#0088ff', marginBottom: 8 }}>
@@ -801,11 +812,17 @@ export default function PdfEditor() {
                 {selAnn.type === 'text' && (
                   <>
                     <label style={S.label}>Text</label>
-                    <input
-                      value={selAnn.text ?? ''}
+                    <input value={selAnn.text ?? ''}
                       onChange={(e) => updateSelAnn({ text: e.target.value, w: e.target.value.length * 9 })}
-                      style={{ border: '1px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box', fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8 }}
+                      style={{ border: '1px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8 }}
                     />
+                    <label style={S.label}>Font</label>
+                    <select value={selAnn.fontFamily ?? 'Poppins, sans-serif'}
+                      onChange={(e) => updateSelAnn({ fontFamily: e.target.value })}
+                      style={{ border: '2px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8, cursor: 'pointer' }}
+                    >
+                      {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                    </select>
                   </>
                 )}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontFamily: 'Poppins, sans-serif', fontSize: 11 }}>
