@@ -16,6 +16,9 @@ interface Annotation {
   type: AnnType;
   x: number; y: number; w: number; h: number;
   color: string;
+  opacity?: number;      // 0–1, for image annotations
+  lockAspect?: boolean;  // maintain aspect ratio on resize
+  naturalAr?: number;    // natural w/h ratio (set at creation time)
   text?: string;
   imageSrc?: string;
 }
@@ -174,7 +177,7 @@ export default function PdfEditor() {
       } else if (ann.type === 'image' && ann.imageSrc) {
         const img = imageCache.current.get(ann.imageSrc);
         if (img) {
-          ctx.globalAlpha = 0.9;
+          ctx.globalAlpha = ann.opacity ?? 1;
           ctx.drawImage(img, ann.x, ann.y, ann.w, ann.h);
           ctx.globalAlpha = 1;
           ctx.strokeStyle = '#000';
@@ -385,6 +388,16 @@ export default function PdfEditor() {
         // Clamp to minimum size
         if (updated.w < 10) { updated.w = 10; if (ia.handle?.includes('w')) updated.x = orig.x + orig.w - 10; }
         if (updated.h < 10) { updated.h = 10; if (ia.handle?.includes('n')) updated.y = orig.y + orig.h - 10; }
+        // Aspect ratio constraint
+        if (orig.lockAspect && orig.naturalAr) {
+          const ar = orig.naturalAr;
+          const h = ia.handle;
+          if (h === 'nw' || h === 'ne' || h === 'se' || h === 'sw') {
+            updated.w = Math.max(10, updated.w);
+            updated.h = updated.w / ar;
+            if (h === 'nw' || h === 'ne') updated.y = orig.y + orig.h - updated.h;
+          }
+        }
       }
 
       const next = annotationsRef.current.map((a) =>
@@ -440,6 +453,8 @@ export default function PdfEditor() {
         id: uid(), pageId: activePage, type: 'image',
         x: 20, y: 20, w, h,
         color: '#000', imageSrc: src,
+        opacity: 1,
+        naturalAr: w / h,
       };
       const next = [...annotations, newAnn];
       annotationsRef.current = next;
@@ -551,7 +566,11 @@ export default function PdfEditor() {
             ctx.fillText(ann.text, ann.x * scaleX, ann.y * scaleY);
           } else if (ann.type === 'image' && ann.imageSrc) {
             const img = imageCache.current.get(ann.imageSrc);
-            if (img) ctx.drawImage(img, ann.x * scaleX, ann.y * scaleY, ann.w * scaleX, ann.h * scaleY);
+            if (img) {
+              ctx.globalAlpha = ann.opacity ?? 1;
+              ctx.drawImage(img, ann.x * scaleX, ann.y * scaleY, ann.w * scaleX, ann.h * scaleY);
+              ctx.globalAlpha = 1;
+            }
           }
           ctx.restore();
         });
@@ -765,6 +784,19 @@ export default function PdfEditor() {
                     </>
                   )}
                 </div>
+                {selAnn.type === 'image' && (
+                  <div style={{ marginTop: 8 }}>
+                    <label style={S.label}>Opacity: {Math.round((selAnn.opacity ?? 1) * 100)}%</label>
+                    <input type='range' min={0} max={100} value={Math.round((selAnn.opacity ?? 1) * 100)}
+                      onChange={(e) => updateSelAnn({ opacity: parseInt(e.target.value) / 100 })}
+                      style={{ width: '100%', marginBottom: 8 }} />
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                      <input type='checkbox' checked={selAnn.lockAspect ?? false}
+                        onChange={(e) => updateSelAnn({ lockAspect: e.target.checked })} />
+                      Lock aspect ratio
+                    </label>
+                  </div>
+                )}
               </>
             ) : (
               <p style={{ ...S.p, color: '#888' }}>

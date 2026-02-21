@@ -8,7 +8,7 @@ const HANDLE_SZ = 8;  // visual size of handles (px)
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Tool = 'select' | 'pencil' | 'eraser' | 'fill' | 'line' | 'rect' | 'ellipse' | 'text';
+type Tool = 'select' | 'pencil' | 'eraser' | 'fill' | 'line' | 'rect' | 'ellipse' | 'text' | 'crop';
 type BlendMode = 'source-over' | 'multiply' | 'screen' | 'overlay';
 type HandlePos = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
@@ -38,6 +38,8 @@ interface PaintObj {
   color?: string;
   // image
   src?: string;
+  lockAspect?: boolean;  // maintain aspect ratio on resize
+  naturalAr?: number;    // natural w/h ratio
 }
 
 // ── Pure utility functions (outside component) ────────────────────────────────
@@ -275,6 +277,7 @@ export default function PaintEditor() {
   const [opacity, setOpacity] = useState(1);
   const [textInput, setTextInput] = useState('Hello');
   const [fontSize, setFontSize] = useState(24);
+  const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
 
   // ── Refs (always-fresh values for event callbacks) ─────────────────────────
   const layersRef = useRef(layers);           layersRef.current = layers;
@@ -311,6 +314,9 @@ export default function PaintEditor() {
 
   // For text cursor preview
   const cursorPos = useRef<{ x: number; y: number } | null>(null);
+  // For crop tool
+  const cropRectRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
+  cropRectRef.current = cropRect;
 
   // ── History ────────────────────────────────────────────────────────────────
   const history = useRef<{ pixels: { id: string; data: ImageData }[]; objects: PaintObj[] }[]>([]);
@@ -425,6 +431,23 @@ export default function PaintEditor() {
       overlay.font = `${fSize}px Poppins, sans-serif`;
       overlay.textBaseline = 'top';
       overlay.fillText(txt, x, y);
+      overlay.restore();
+    }
+
+    // Crop rect overlay
+    if (cropRectRef.current) {
+      const { x, y, w, h } = cropRectRef.current;
+      overlay.save();
+      overlay.fillStyle = 'rgba(0,0,0,0.45)';
+      overlay.fillRect(0, 0, W, y);
+      overlay.fillRect(0, y + h, W, H - y - h);
+      overlay.fillRect(0, y, x, h);
+      overlay.fillRect(x + w, y, W - x - w, h);
+      overlay.strokeStyle = '#fff';
+      overlay.lineWidth = 1.5;
+      overlay.setLineDash([5, 4]);
+      overlay.strokeRect(x, y, w, h);
+      overlay.setLineDash([]);
       overlay.restore();
     }
   }, []);
@@ -550,6 +573,13 @@ export default function PaintEditor() {
       return;
     }
 
+    if (t === 'crop') {
+      // Clear any existing crop rect and start fresh
+      cropRectRef.current = null;
+      setCropRect(null);
+      return;
+    }
+
     if (!al) return;
     const pc = pixelCanvases.current.get(al);
     if (!pc) return;
@@ -640,6 +670,18 @@ export default function PaintEditor() {
 
     const al = activeLayerRef.current;
 
+    if (t === 'crop' && startPos.current) {
+      const x = Math.min(startPos.current.x, pos.x);
+      const y = Math.min(startPos.current.y, pos.y);
+      const w = Math.abs(pos.x - startPos.current.x);
+      const h = Math.abs(pos.y - startPos.current.y);
+      const rect = { x, y, w, h };
+      cropRectRef.current = rect;
+      setCropRect(rect);
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
+    }
+
     if (t === 'select') {
       const selId = selectedIdRef.current;
       if (!selId || !dragMode.current) return;
@@ -650,8 +692,27 @@ export default function PaintEditor() {
       const objs = objectsRef.current.map((o) => {
         if (o.id !== selId) return o;
         if (dragMode.current === 'move') return { ...o, x: o.x + dx, y: o.y + dy };
-        if (dragMode.current === 'resize' && dragHandle.current) {
-          return applyResize(o, dragHandle.current, dx, dy);
+        if (dragMode.current === 'resize' && dragHandle.current && dragOrigObj.current) {
+          const orig = dragOrigObj.current;
+          const totalDx = pos.x - startPos.current!.x;
+          const totalDy = pos.y - startPos.current!.y;
+          let updated = applyResize({ ...orig }, dragHandle.current, totalDx, totalDy);
+          // Aspect ratio constraint for images
+          if (orig.lockAspect && orig.naturalAr && orig.type !== 'line') {
+            const ar = orig.naturalAr;
+            const handle = dragHandle.current;
+            const isNS = handle === 'n' || handle === 's';
+            if (isNS) {
+              updated.h = Math.max(10, updated.h);
+              updated.w = updated.h * ar;
+              updated.x = orig.x + orig.w / 2 - updated.w / 2;
+            } else {
+              updated.w = Math.max(10, updated.w);
+              updated.h = updated.w / ar;
+              if (handle === 'nw' || handle === 'ne') updated.y = orig.y + orig.h - updated.h;
+            }
+          }
+          return updated;
         }
         return o;
       });
@@ -686,6 +747,23 @@ export default function PaintEditor() {
     const pos = getPos(e);
     const t = toolRef.current;
     const al = activeLayerRef.current;
+
+    if (t === 'crop' && startPos.current) {
+      const x = Math.min(startPos.current.x, pos.x);
+      const y = Math.min(startPos.current.y, pos.y);
+      const w = Math.abs(pos.x - startPos.current.x);
+      const h = Math.abs(pos.y - startPos.current.y);
+      if (w > 3 && h > 3) {
+        const rect = { x, y, w, h };
+        cropRectRef.current = rect;
+        setCropRect(rect);
+      } else {
+        cropRectRef.current = null;
+        setCropRect(null);
+      }
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
+    }
 
     if (t === 'select') {
       if (dragMode.current) {
@@ -827,6 +905,7 @@ export default function PaintEditor() {
       const newObj: PaintObj = {
         id: uid(), layerId: activeLayerRef.current!, type: 'image',
         x, y, w, h, opacity: 1, src,
+        naturalAr: w / h,
       };
       const objs = [...objectsRef.current, newObj];
       objectsRef.current = objs;
@@ -839,6 +918,43 @@ export default function PaintEditor() {
     };
     img.src = src;
   }, [renderAll]);
+
+  // ── Crop ────────────────────────────────────────────────────────────────────
+
+  const applyCrop = useCallback((rect: { x: number; y: number; w: number; h: number }) => {
+    saveHistory();
+    const ix = Math.max(0, Math.round(rect.x));
+    const iy = Math.max(0, Math.round(rect.y));
+    const iw = Math.min(W - ix, Math.round(rect.w));
+    const ih = Math.min(H - iy, Math.round(rect.h));
+    // Shift pixel canvas content so crop top-left becomes (0,0)
+    pixelCanvases.current.forEach((pc) => {
+      const ctx = pc.getContext('2d')!;
+      const data = ctx.getImageData(ix, iy, iw, ih);
+      ctx.clearRect(0, 0, W, H);
+      ctx.putImageData(data, 0, 0);
+    });
+    // Shift all objects by the crop offset
+    const objs = objectsRef.current.map((o) => ({ ...o, x: o.x - ix, y: o.y - iy }));
+    objectsRef.current = objs;
+    setObjects(objs);
+    setSelectedId(null);
+    selectedIdRef.current = null;
+    cropRectRef.current = null;
+    setCropRect(null);
+    setTool('select');
+    toolRef.current = 'select';
+    renderAll(layersRef.current, objs, null);
+  }, [renderAll]);
+
+  const cropToSelection = useCallback(() => {
+    const sel = selectedIdRef.current
+      ? objectsRef.current.find((o) => o.id === selectedIdRef.current)
+      : null;
+    if (!sel) return;
+    const bounds = getDisplayBounds(sel);
+    applyCrop(bounds);
+  }, [applyCrop]);
 
   // ── Export / new ───────────────────────────────────────────────────────────
 
@@ -913,6 +1029,7 @@ export default function PaintEditor() {
     { id: 'rect', label: 'Rect', icon: '▭' },
     { id: 'ellipse', label: 'Ellipse', icon: '◯' },
     { id: 'text', label: 'Text', icon: 'T' },
+    { id: 'crop', label: 'Crop', icon: '✂' },
   ];
 
   const BLENDS: BlendMode[] = ['source-over', 'multiply', 'screen', 'overlay'];
@@ -937,6 +1054,21 @@ export default function PaintEditor() {
           <button style={S.smallBtn('#f44', '#fff')} onClick={deleteSelected}>
             ✕ Delete selected
           </button>
+        )}
+        {selectedId && (
+          <button style={S.smallBtn()} onClick={cropToSelection} title='Crop canvas to bounding box of selected object'>
+            ✂ Crop to Selection
+          </button>
+        )}
+        {cropRect && (
+          <>
+            <button style={S.smallBtn('#0a0', '#fff')} onClick={() => applyCrop(cropRect)}>✓ Apply Crop</button>
+            <button style={S.smallBtn()} onClick={() => {
+              cropRectRef.current = null;
+              setCropRect(null);
+              renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+            }}>✕ Cancel</button>
+          </>
         )}
       </div>
 
@@ -996,6 +1128,14 @@ export default function PaintEditor() {
                     }}
                     style={{ width: '100%' }} />
                 </>
+              )}
+
+              {selObj.type === 'image' && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: 4, ...S.label, marginTop: 6, cursor: 'pointer' }}>
+                  <input type='checkbox' checked={selObj.lockAspect ?? false}
+                    onChange={(e) => updateSelectedObj({ lockAspect: e.target.checked })} />
+                  Lock aspect ratio
+                </label>
               )}
 
               <label style={{ ...S.label, marginTop: 6 }}>Opacity: {Math.round((selObj.opacity ?? 1) * 100)}%</label>
