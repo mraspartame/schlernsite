@@ -35,6 +35,7 @@ interface PaintObj {
   // text
   text?: string;
   fontSize?: number;
+  fontFamily?: string;
   color?: string;
   // image
   src?: string;
@@ -131,9 +132,9 @@ function normBounds(o: PaintObj): PaintObj {
   return r;
 }
 
-function measureText(text: string, fontSize: number): { w: number; h: number } {
+function measureText(text: string, fontSize: number, fontFamily = 'Poppins, sans-serif'): { w: number; h: number } {
   const c = document.createElement('canvas').getContext('2d')!;
-  c.font = `${fontSize}px Poppins, sans-serif`;
+  c.font = `${fontSize}px ${fontFamily}`;
   return { w: Math.ceil(c.measureText(text).width), h: Math.ceil(fontSize * 1.4) };
 }
 
@@ -168,7 +169,7 @@ function drawObj(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<strin
       break;
     case 'text':
       ctx.fillStyle = o.color ?? '#000';
-      ctx.font = `${o.fontSize ?? 24}px Poppins, sans-serif`;
+      ctx.font = `${o.fontSize ?? 24}px ${o.fontFamily ?? 'Poppins, sans-serif'}`;
       ctx.textBaseline = 'top';
       ctx.fillText(o.text ?? '', o.x, o.y);
       break;
@@ -277,6 +278,7 @@ export default function PaintEditor() {
   const [opacity, setOpacity] = useState(1);
   const [textInput, setTextInput] = useState('Hello');
   const [fontSize, setFontSize] = useState(24);
+  const [fontFamily, setFontFamily] = useState('Poppins, sans-serif');
   const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
 
   // ── Refs (always-fresh values for event callbacks) ─────────────────────────
@@ -289,6 +291,7 @@ export default function PaintEditor() {
   const opacityRef = useRef(opacity);         opacityRef.current = opacity;
   const textInputRef = useRef(textInput);     textInputRef.current = textInput;
   const fontSizeRef = useRef(fontSize);       fontSizeRef.current = fontSize;
+  const fontFamilyRef = useRef(fontFamily);   fontFamilyRef.current = fontFamily;
   const activeLayerRef = useRef(activeLayerId); activeLayerRef.current = activeLayerId;
 
   // ── Canvas refs ────────────────────────────────────────────────────────────
@@ -428,7 +431,7 @@ export default function PaintEditor() {
       overlay.save();
       overlay.globalAlpha = 0.5;
       overlay.fillStyle = colorRef.current;
-      overlay.font = `${fSize}px Poppins, sans-serif`;
+      overlay.font = `${fSize}px ${fontFamilyRef.current}`;
       overlay.textBaseline = 'top';
       overlay.fillText(txt, x, y);
       overlay.restore();
@@ -596,14 +599,15 @@ export default function PaintEditor() {
 
     if (t === 'text') {
       const fSize = fontSizeRef.current;
+      const ff = fontFamilyRef.current;
       const txt = textInputRef.current || 'Text';
-      const dims = measureText(txt, fSize);
+      const dims = measureText(txt, fSize, ff);
       saveHistory();
       const newObj: PaintObj = {
         id: uid(), layerId: al, type: 'text',
         x: pos.x, y: pos.y, w: dims.w, h: dims.h,
         opacity: opacityRef.current,
-        text: txt, fontSize: fSize, color: colorRef.current,
+        text: txt, fontSize: fSize, fontFamily: ff, color: colorRef.current,
       };
       const next = [...objectsRef.current, newObj];
       objectsRef.current = next;
@@ -1020,6 +1024,14 @@ export default function PaintEditor() {
 
   const selObj = objects.find((o) => o.id === selectedId) ?? null;
 
+  const FONTS = [
+    { label: 'Poppins', value: 'Poppins, sans-serif' },
+    { label: 'DM Serif Text', value: 'DM Serif Text, serif' },
+    { label: 'Monospace', value: 'monospace' },
+  ];
+
+  const SWATCHES = ['#000000', '#ffffff', '#2563eb', '#16a34a', '#dc2626', '#9333ea'];
+
   const TOOLS: { id: Tool; label: string; icon: string }[] = [
     { id: 'select', label: 'Select', icon: '↖' },
     { id: 'pencil', label: 'Pencil', icon: '✏️' },
@@ -1112,9 +1124,18 @@ export default function PaintEditor() {
                   <label style={S.label}>Text</label>
                   <input style={S.input} value={selObj.text ?? ''}
                     onChange={(e) => {
-                      const dims = measureText(e.target.value, selObj.fontSize ?? 24);
+                      const dims = measureText(e.target.value, selObj.fontSize ?? 24, selObj.fontFamily);
                       updateSelectedObj({ text: e.target.value, w: dims.w, h: dims.h });
                     }} />
+                  <label style={S.label}>Font</label>
+                  <select value={selObj.fontFamily ?? 'Poppins, sans-serif'}
+                    onChange={(e) => {
+                      const dims = measureText(selObj.text ?? '', selObj.fontSize ?? 24, e.target.value);
+                      updateSelectedObj({ fontFamily: e.target.value, w: dims.w, h: dims.h });
+                    }}
+                    style={{ width: '100%', border: '1px solid #000', padding: '3px 4px', fontFamily: 'Poppins, sans-serif', fontSize: 11, marginBottom: 4 }}>
+                    {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                  </select>
                   <label style={S.label}>Color</label>
                   <input type='color' value={selObj.color ?? '#000000'}
                     onChange={(e) => updateSelectedObj({ color: e.target.value })}
@@ -1123,7 +1144,7 @@ export default function PaintEditor() {
                   <input type='range' min={8} max={200} value={selObj.fontSize ?? 24}
                     onChange={(e) => {
                       const fz = parseInt(e.target.value);
-                      const dims = measureText(selObj.text ?? '', fz);
+                      const dims = measureText(selObj.text ?? '', fz, selObj.fontFamily);
                       updateSelectedObj({ fontSize: fz, w: dims.w, h: dims.h });
                     }}
                     style={{ width: '100%' }} />
@@ -1148,6 +1169,13 @@ export default function PaintEditor() {
               <label style={S.label}>Color</label>
               <input type='color' value={color} onChange={(e) => setColor(e.target.value)}
                 style={{ width: '100%', height: 30, border: '2px solid #000', padding: 0, cursor: 'pointer', marginBottom: 4 }} />
+              {/* Quick-select swatches */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginBottom: 6 }}>
+                {SWATCHES.map((c) => (
+                  <button key={c} onClick={() => setColor(c)} title={c}
+                    style={{ width: 22, height: 22, background: c, border: color === c ? '3px solid #0088ff' : '2px solid #000', cursor: 'pointer', padding: 0, boxSizing: 'border-box' as const }} />
+                ))}
+              </div>
 
               <label style={{ ...S.label, marginTop: 4 }}>Size: {brushSize}px</label>
               <input type='range' min={1} max={60} value={brushSize}
@@ -1164,13 +1192,18 @@ export default function PaintEditor() {
                   <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
                   <label style={S.label}>Text to place</label>
                   <input style={S.input} value={textInput} onChange={(e) => setTextInput(e.target.value)} placeholder='Enter text…' />
+                  <label style={S.label}>Font</label>
+                  <select value={fontFamily} onChange={(e) => setFontFamily(e.target.value)}
+                    style={{ width: '100%', border: '1px solid #000', padding: '3px 4px', fontFamily: 'Poppins, sans-serif', fontSize: 11, marginBottom: 4 }}>
+                    {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                  </select>
                   <label style={S.label}>Font size: {fontSize}px</label>
                   <input type='range' min={8} max={200} value={fontSize}
                     onChange={(e) => setFontSize(parseInt(e.target.value))}
                     style={{ width: '100%', marginBottom: 6 }} />
                   {/* Live font preview */}
                   <div style={{ border: '1px dashed #999', padding: 6, background: '#fafafa', minHeight: 40, overflow: 'hidden' }}>
-                    <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: Math.min(fontSize, 48), color, lineHeight: 1.2, display: 'block', whiteSpace: 'pre' }}>
+                    <span style={{ fontFamily, fontSize: Math.min(fontSize, 48), color, lineHeight: 1.2, display: 'block', whiteSpace: 'pre' }}>
                       {textInput || 'Preview'}
                     </span>
                   </div>

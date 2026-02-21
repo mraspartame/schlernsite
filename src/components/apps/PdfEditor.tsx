@@ -20,8 +20,17 @@ interface Annotation {
   lockAspect?: boolean;  // maintain aspect ratio on resize
   naturalAr?: number;    // natural w/h ratio (set at creation time)
   text?: string;
+  fontFamily?: string;
   imageSrc?: string;
 }
+
+const FONTS = [
+  { label: 'Poppins', value: 'Poppins, sans-serif' },
+  { label: 'DM Serif Text', value: 'DM Serif Text, serif' },
+  { label: 'Monospace', value: 'monospace' },
+];
+
+const PAGE_GAP = 14; // px gap between pages in the multi-page canvas
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
@@ -80,6 +89,7 @@ export default function PdfEditor() {
   const [selectedAnnId, setSelectedAnnId] = useState<string | null>(null);
   const [tool, setTool] = useState<'select' | 'rect' | 'text' | 'image'>('select');
   const [annColor, setAnnColor] = useState('#ffff00');
+  const [annFont, setAnnFont] = useState('Poppins, sans-serif');
   const [textInput, setTextInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadProgress, setLoadProgress] = useState(0);
@@ -90,14 +100,18 @@ export default function PdfEditor() {
   const pdfDocRef = useRef<any>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<File | null>(null);
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
+  /** Per-page layout in the combined multi-page canvas: { y, w, h } */
+  const pageLayouts = useRef<Map<string, { y: number; w: number; h: number }>>(new Map());
 
   // Refs for event handlers
   const annotationsRef = useRef(annotations);   annotationsRef.current = annotations;
   const selectedAnnRef = useRef(selectedAnnId); selectedAnnRef.current = selectedAnnId;
   const toolRef = useRef(tool);                 toolRef.current = tool;
   const colorRef = useRef(annColor);            colorRef.current = annColor;
+  const annFontRef = useRef(annFont);           annFontRef.current = annFont;
   const textInputRef = useRef(textInput);       textInputRef.current = textInput;
   const activePageRef = useRef(activePage);     activePageRef.current = activePage;
 
@@ -128,84 +142,66 @@ export default function PdfEditor() {
     });
   }, []);
 
-  // ── Render PDF page to canvas ─────────────────────────────────────────────
-
-  const renderPage = useCallback(async (pageNum: number, pdfDoc?: any) => {
-    const doc = pdfDoc ?? pdfDocRef.current;
-    if (!doc || !canvasRef.current || !overlayRef.current || pageNum < 1) return;
-    const page = await doc.getPage(pageNum);
-    const vp = page.getViewport({ scale: viewScale });
-    canvasRef.current.width = vp.width;
-    canvasRef.current.height = vp.height;
-    overlayRef.current.width = vp.width;
-    overlayRef.current.height = vp.height;
-    await page.render({ canvasContext: canvasRef.current.getContext('2d')!, viewport: vp }).promise;
-  }, [viewScale]);
-
-  // ── Draw annotations on overlay canvas ───────────────────────────────────
+  // ── Draw annotations on overlay canvas (all pages with y-offsets) ─────────
+  // Must be declared before renderAllPages which calls it.
 
   const redrawOverlay = useCallback((
     currentAnns: Annotation[],
     currentSelId: string | null,
-    pageId: string | null,
   ) => {
     if (!overlayRef.current) return;
     const ctx = overlayRef.current.getContext('2d')!;
-    const W = overlayRef.current.width;
-    const H = overlayRef.current.height;
-    ctx.clearRect(0, 0, W, H);
+    ctx.clearRect(0, 0, overlayRef.current.width, overlayRef.current.height);
 
-    if (!pageId) return;
-    const pageAnns = currentAnns.filter((a) => a.pageId === pageId);
+    for (const ann of currentAnns) {
+      const layout = pageLayouts.current.get(ann.pageId);
+      if (!layout) continue;
+      const oy = layout.y; // page y-offset in combined canvas
 
-    pageAnns.forEach((ann) => {
       ctx.save();
       if (ann.type === 'rect') {
         ctx.globalAlpha = 0.35;
         ctx.fillStyle = ann.color;
-        ctx.fillRect(ann.x, ann.y, ann.w, ann.h);
+        ctx.fillRect(ann.x, ann.y + oy, ann.w, ann.h);
         ctx.globalAlpha = 1;
         ctx.strokeStyle = ann.color;
         ctx.lineWidth = 2;
-        ctx.strokeRect(ann.x, ann.y, ann.w, ann.h);
+        ctx.strokeRect(ann.x, ann.y + oy, ann.w, ann.h);
       } else if (ann.type === 'text' && ann.text) {
-        ctx.font = 'bold 16px Poppins, sans-serif';
+        const ff = ann.fontFamily ?? 'Poppins, sans-serif';
+        ctx.font = `bold 16px ${ff}`;
         ctx.fillStyle = '#fff';
-        ctx.fillText(ann.text, ann.x + 1, ann.y + 1);
+        ctx.fillText(ann.text, ann.x + 1, ann.y + oy + 1);
         ctx.fillStyle = ann.color;
-        ctx.fillText(ann.text, ann.x, ann.y);
+        ctx.fillText(ann.text, ann.x, ann.y + oy);
       } else if (ann.type === 'image' && ann.imageSrc) {
         const img = imageCache.current.get(ann.imageSrc);
         if (img) {
           ctx.globalAlpha = ann.opacity ?? 1;
-          ctx.drawImage(img, ann.x, ann.y, ann.w, ann.h);
+          ctx.drawImage(img, ann.x, ann.y + oy, ann.w, ann.h);
           ctx.globalAlpha = 1;
           ctx.strokeStyle = '#000';
           ctx.lineWidth = 1;
-          ctx.strokeRect(ann.x, ann.y, ann.w, ann.h);
+          ctx.strokeRect(ann.x, ann.y + oy, ann.w, ann.h);
         }
       }
       ctx.restore();
-    });
 
-    // Draw selection
-    if (currentSelId) {
-      const sel = pageAnns.find((a) => a.id === currentSelId);
-      if (sel) {
+      // Draw selection handles
+      if (currentSelId === ann.id) {
         ctx.save();
         ctx.strokeStyle = '#0088ff';
         ctx.lineWidth = 2;
         ctx.setLineDash([5, 3]);
-        ctx.strokeRect(sel.x - 3, sel.y - 3, sel.w + 6, sel.h + 6);
+        ctx.strokeRect(ann.x - 3, ann.y + oy - 3, ann.w + 6, ann.h + 6);
         ctx.setLineDash([]);
-        // Corner handles (only for non-text objects, since text size isn't user-resizable)
-        if (sel.type !== 'text') {
+        if (ann.type !== 'text') {
           ctx.fillStyle = '#fff';
           ctx.strokeStyle = '#0088ff';
           ctx.lineWidth = 1.5;
-          for (const h of getHandlePositions(sel)) {
-            ctx.fillRect(h.x - 5, h.y - 5, 10, 10);
-            ctx.strokeRect(h.x - 5, h.y - 5, 10, 10);
+          for (const h of getHandlePositions(ann)) {
+            ctx.fillRect(h.x - 5, h.y + oy - 5, 10, 10);
+            ctx.strokeRect(h.x - 5, h.y + oy - 5, 10, 10);
           }
         }
         ctx.restore();
@@ -213,19 +209,73 @@ export default function PdfEditor() {
     }
   }, []);
 
+  // ── Render all pages stacked vertically into a single canvas ─────────────
+
+  const renderAllPages = useCallback(async (pagesArg: PageEntry[], scale: number) => {
+    const doc = pdfDocRef.current;
+    if (!doc || !canvasRef.current || !overlayRef.current) return;
+
+    let totalH = PAGE_GAP;
+    let maxW = 0;
+    const layouts = new Map<string, { y: number; w: number; h: number }>();
+
+    // First pass: measure dimensions of every page
+    for (const entry of pagesArg) {
+      let pw: number, ph: number;
+      if (entry.pageNum < 1) {
+        pw = Math.round(595 * scale); ph = Math.round(842 * scale);
+      } else {
+        const page = await doc.getPage(entry.pageNum);
+        const vp = page.getViewport({ scale });
+        pw = Math.round(vp.width); ph = Math.round(vp.height);
+      }
+      layouts.set(entry.id, { y: totalH, w: pw, h: ph });
+      totalH += ph + PAGE_GAP;
+      maxW = Math.max(maxW, pw);
+    }
+
+    pageLayouts.current = layouts;
+    const cW = maxW, cH = totalH;
+    canvasRef.current.width = cW;
+    canvasRef.current.height = cH;
+    overlayRef.current.width = cW;
+    overlayRef.current.height = cH;
+
+    const ctx = canvasRef.current.getContext('2d')!;
+    ctx.fillStyle = '#777';
+    ctx.fillRect(0, 0, cW, cH);
+
+    // Second pass: render each page
+    for (const entry of pagesArg) {
+      const layout = layouts.get(entry.id)!;
+      if (entry.pageNum < 1) {
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, layout.y, layout.w, layout.h);
+      } else {
+        const page = await doc.getPage(entry.pageNum);
+        const vp = page.getViewport({ scale });
+        const tmp = document.createElement('canvas');
+        tmp.width = vp.width; tmp.height = vp.height;
+        await page.render({ canvasContext: tmp.getContext('2d')!, viewport: vp }).promise;
+        ctx.drawImage(tmp, 0, layout.y);
+      }
+    }
+
+    // Redraw annotation overlay after pages render
+    redrawOverlay(annotationsRef.current, selectedAnnRef.current);
+  }, [redrawOverlay]);
+
   // Sync overlay whenever annotations or selection changes
   useEffect(() => {
-    redrawOverlay(annotations, selectedAnnId, activePage);
-  }, [annotations, selectedAnnId, activePage, redrawOverlay]);
+    redrawOverlay(annotations, selectedAnnId);
+  }, [annotations, selectedAnnId, redrawOverlay]);
 
-  // ── Active page rendering ─────────────────────────────────────────────────
-
+  // Re-render all pages when page list or zoom changes
   useEffect(() => {
-    if (activePage && pdfDocRef.current) {
-      const entry = pages.find((p) => p.id === activePage);
-      if (entry && entry.pageNum > 0) renderPage(entry.pageNum);
+    if (pdfDocRef.current && pages.length > 0) {
+      renderAllPages(pages, viewScale);
     }
-  }, [activePage, viewScale, renderPage]);
+  }, [pages, viewScale, renderAllPages]);
 
   // ── Load PDF ──────────────────────────────────────────────────────────────
 

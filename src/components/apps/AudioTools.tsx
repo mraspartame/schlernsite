@@ -37,40 +37,6 @@ const S = {
   }),
 };
 
-// ── Waveform canvas helper ────────────────────────────────────────────────────
-
-function drawWaveform(canvas: HTMLCanvasElement, buffer: AudioBuffer, startSec = 0, endSec?: number) {
-  const ctx = canvas.getContext('2d')!;
-  const data = buffer.getChannelData(0);
-  const dur = buffer.duration;
-  const s = Math.floor((startSec / dur) * data.length);
-  const e = Math.floor(((endSec ?? dur) / dur) * data.length);
-  const slice = data.slice(s, e);
-
-  const W = canvas.width;
-  const H = canvas.height;
-  ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#f5f5f5';
-  ctx.fillRect(0, 0, W, H);
-
-  const step = Math.ceil(slice.length / W);
-  ctx.strokeStyle = '#000';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  for (let i = 0; i < W; i++) {
-    let min = 1, max = -1;
-    for (let j = 0; j < step; j++) {
-      const v = slice[i * step + j] ?? 0;
-      if (v < min) min = v;
-      if (v > max) max = v;
-    }
-    const yMin = ((min + 1) / 2) * H;
-    const yMax = ((max + 1) / 2) * H;
-    ctx.moveTo(i, yMin);
-    ctx.lineTo(i, yMax);
-  }
-  ctx.stroke();
-}
 
 // ── Mic Tester ────────────────────────────────────────────────────────────────
 
@@ -231,7 +197,92 @@ function AudioTrimmer() {
   const [trimmedUrl, setTrimmedUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+
   const waveRef = useRef<HTMLCanvasElement>(null);
+  // Always-fresh refs for canvas event handlers (avoid stale closures)
+  const startRef = useRef(0);
+  const endRef = useRef(0);
+  const durRef = useRef(0);
+  const bufRef = useRef<AudioBuffer | null>(null);
+  const draggingRef = useRef<'start' | 'end' | null>(null);
+  const previewSrcRef = useRef<AudioBufferSourceNode | null>(null);
+  const previewCtxRef = useRef<AudioContext | null>(null);
+
+  startRef.current = startSec;
+  endRef.current = endSec;
+  durRef.current = duration;
+  bufRef.current = buffer;
+
+  // Format M:SS.hh
+  const fmt = (s: number) => {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    const hh = Math.floor((s % 1) * 100);
+    return `${m}:${String(sec).padStart(2, '0')}.${String(hh).padStart(2, '0')}`;
+  };
+
+  // Draw the waveform + selection region + start/end markers
+  const drawWave = useCallback(() => {
+    const canvas = waveRef.current;
+    const buf = bufRef.current;
+    if (!canvas || !buf) return;
+    const W = canvas.offsetWidth || 600;
+    if (canvas.width !== W) canvas.width = W;
+    canvas.height = 120;
+    const ctx = canvas.getContext('2d')!;
+    const H = 120;
+    const dur = buf.duration;
+    const data = buf.getChannelData(0);
+
+    ctx.fillStyle = '#f5f5f5';
+    ctx.fillRect(0, 0, W, H);
+
+    const sx = (startRef.current / dur) * W;
+    const ex = (endRef.current / dur) * W;
+
+    // Selected region tint
+    ctx.fillStyle = 'rgba(0,120,255,0.10)';
+    ctx.fillRect(sx, 0, ex - sx, H);
+
+    // Waveform bars
+    const step = Math.max(1, Math.ceil(data.length / W));
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < W; i++) {
+      let mn = 1, mx = -1;
+      for (let j = 0; j < step; j++) {
+        const v = data[i * step + j] ?? 0;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      ctx.moveTo(i + 0.5, ((mn + 1) / 2) * H);
+      ctx.lineTo(i + 0.5, ((mx + 1) / 2) * H);
+    }
+    ctx.stroke();
+
+    // Start marker (green line + downward triangle handle)
+    ctx.strokeStyle = '#0a0';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke();
+    ctx.fillStyle = '#0a0';
+    ctx.beginPath();
+    ctx.moveTo(sx - 8, 0); ctx.lineTo(sx + 8, 0); ctx.lineTo(sx, 14);
+    ctx.closePath(); ctx.fill();
+
+    // End marker (red line + downward triangle handle)
+    ctx.strokeStyle = '#c00';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(ex, 0); ctx.lineTo(ex, H); ctx.stroke();
+    ctx.fillStyle = '#c00';
+    ctx.beginPath();
+    ctx.moveTo(ex - 8, 0); ctx.lineTo(ex + 8, 0); ctx.lineTo(ex, 14);
+    ctx.closePath(); ctx.fill();
+  }, []);
+
+  useEffect(() => { drawWave(); }, [startSec, endSec, drawWave]);
+  useEffect(() => { if (buffer) setTimeout(drawWave, 30); }, [buffer, drawWave]);
 
   const loadFile = async (f: File) => {
     setFile(f);
@@ -239,14 +290,18 @@ function AudioTrimmer() {
     setLoading(true);
     setTrimmedUrl(null);
     try {
-      const arrayBuffer = await f.arrayBuffer();
-      const ctx = new AudioContext();
-      const buf = await ctx.decodeAudioData(arrayBuffer);
+      const ab = await f.arrayBuffer();
+      const actx = new AudioContext();
+      const buf = await actx.decodeAudioData(ab);
+      bufRef.current = buf;
       setBuffer(buf);
       setDuration(buf.duration);
       setStartSec(0);
       setEndSec(buf.duration);
-      ctx.close();
+      startRef.current = 0;
+      endRef.current = buf.duration;
+      durRef.current = buf.duration;
+      actx.close();
     } catch (e: any) {
       setError('Could not decode audio: ' + (e.message ?? e));
     } finally {
@@ -254,40 +309,123 @@ function AudioTrimmer() {
     }
   };
 
-  useEffect(() => {
-    if (buffer && waveRef.current) {
-      waveRef.current.width = waveRef.current.offsetWidth || 600;
-      waveRef.current.height = 80;
-      drawWaveform(waveRef.current, buffer);
-    }
-  }, [buffer]);
+  // Canvas interaction
+  const getFrac = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect = waveRef.current!.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  };
 
+  const onWaveDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const dur = durRef.current;
+    if (!dur) return;
+    const frac = getFrac(e);
+    const t = frac * dur;
+    const W = waveRef.current?.offsetWidth || 600;
+    const SNAP = 14 / W; // snap radius in fraction
+    const startFrac = startRef.current / dur;
+    const endFrac = endRef.current / dur;
+
+    if (Math.abs(frac - startFrac) < SNAP) {
+      draggingRef.current = 'start';
+    } else if (Math.abs(frac - endFrac) < SNAP) {
+      draggingRef.current = 'end';
+    } else {
+      // Move nearest marker to click position
+      if (Math.abs(t - startRef.current) <= Math.abs(t - endRef.current)) {
+        draggingRef.current = 'start';
+        const v = Math.max(0, Math.min(t, endRef.current - 0.01));
+        startRef.current = v; setStartSec(v);
+      } else {
+        draggingRef.current = 'end';
+        const v = Math.max(startRef.current + 0.01, Math.min(dur, t));
+        endRef.current = v; setEndSec(v);
+      }
+    }
+    drawWave();
+  };
+
+  const onWaveMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const dur = durRef.current;
+    const W = waveRef.current?.offsetWidth || 600;
+    const SNAP = 14 / W;
+    const frac = getFrac(e);
+
+    // Update cursor
+    if (waveRef.current) {
+      const startFrac = startRef.current / (dur || 1);
+      const endFrac = endRef.current / (dur || 1);
+      waveRef.current.style.cursor =
+        (Math.abs(frac - startFrac) < SNAP || Math.abs(frac - endFrac) < SNAP)
+          ? 'ew-resize' : 'pointer';
+    }
+
+    if (!draggingRef.current || !dur) return;
+    const t = frac * dur;
+    if (draggingRef.current === 'start') {
+      const v = Math.max(0, Math.min(t, endRef.current - 0.01));
+      startRef.current = v; setStartSec(parseFloat(v.toFixed(2)));
+    } else {
+      const v = Math.max(startRef.current + 0.01, Math.min(dur, t));
+      endRef.current = v; setEndSec(parseFloat(v.toFixed(2)));
+    }
+    drawWave();
+  };
+
+  const onWaveUp = () => { draggingRef.current = null; };
+
+  // Live preview of selection
+  const stopPreview = useCallback(() => {
+    try { previewSrcRef.current?.stop(); } catch {}
+    previewSrcRef.current = null;
+    previewCtxRef.current?.close();
+    previewCtxRef.current = null;
+    setPreviewing(false);
+  }, []);
+
+  const startPreview = async () => {
+    const buf = bufRef.current;
+    if (!buf) return;
+    stopPreview();
+    const actx = new AudioContext();
+    previewCtxRef.current = actx;
+    const sr = buf.sampleRate, ch = buf.numberOfChannels;
+    const s0 = Math.floor(startRef.current * sr);
+    const s1 = Math.floor(endRef.current * sr);
+    if (s1 <= s0) return;
+    const newBuf = actx.createBuffer(ch, s1 - s0, sr);
+    for (let c = 0; c < ch; c++) newBuf.copyToChannel(buf.getChannelData(c).slice(s0, s1), c);
+    const src = actx.createBufferSource();
+    src.buffer = newBuf;
+    src.connect(actx.destination);
+    src.onended = stopPreview;
+    src.start(0);
+    previewSrcRef.current = src;
+    setPreviewing(true);
+  };
+
+  useEffect(() => () => stopPreview(), [stopPreview]);
+
+  // Export trimmed WAV
   const trim = async () => {
-    if (!buffer) return;
+    const buf = bufRef.current;
+    if (!buf) return;
     setLoading(true);
     try {
-      const sampleRate = buffer.sampleRate;
-      const channels = buffer.numberOfChannels;
-      const startSample = Math.floor(startSec * sampleRate);
-      const endSample = Math.floor(endSec * sampleRate);
-      const length = endSample - startSample;
-
-      const ctx = new OfflineAudioContext(channels, length, sampleRate);
-      const source = ctx.createBufferSource();
-
-      const newBuf = ctx.createBuffer(channels, length, sampleRate);
-      for (let c = 0; c < channels; c++) {
-        newBuf.copyToChannel(buffer.getChannelData(c).slice(startSample, endSample), c);
-      }
-      source.buffer = newBuf;
-      source.connect(ctx.destination);
-      source.start(0);
-
-      const rendered = await ctx.startRendering();
+      const sr = buf.sampleRate, ch = buf.numberOfChannels;
+      const s0 = Math.floor(startRef.current * sr);
+      const s1 = Math.floor(endRef.current * sr);
+      const len = s1 - s0;
+      const offCtx = new OfflineAudioContext(ch, len, sr);
+      const newBuf = offCtx.createBuffer(ch, len, sr);
+      for (let c = 0; c < ch; c++) newBuf.copyToChannel(buf.getChannelData(c).slice(s0, s1), c);
+      const src = offCtx.createBufferSource();
+      src.buffer = newBuf;
+      src.connect(offCtx.destination);
+      src.start(0);
+      const rendered = await offCtx.startRendering();
       const wav = audioBufferToWav(rendered);
       if (trimmedUrl) URL.revokeObjectURL(trimmedUrl);
-      const url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
-      setTrimmedUrl(url);
+      setTrimmedUrl(URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })));
     } catch (e: any) {
       setError('Trim failed: ' + (e.message ?? e));
     } finally {
@@ -295,24 +433,18 @@ function AudioTrimmer() {
     }
   };
 
-  const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  const numStyle: React.CSSProperties = { width: 70, border: '1px solid #000', padding: '3px 4px', fontFamily: 'Poppins, sans-serif', fontSize: 12 };
 
   return (
     <div>
       <h2 style={S.h2}>✂️ Audio Trimmer</h2>
-      <p style={{ ...S.p, marginBottom: 16 }}>Load an audio file, set start and end points, export as WAV.</p>
+      <p style={{ ...S.p, marginBottom: 16 }}>Load an audio file, drag the green/red markers on the waveform to set start and end, then preview or export as WAV.</p>
 
-      <input
-        type='file'
-        accept='audio/*,.webm,video/webm'
-        style={{ display: 'none' }}
-        id='audio-input'
-        onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])}
-      />
+      <input type='file' accept='audio/*,.webm,video/webm' style={{ display: 'none' }} id='audio-input'
+        onChange={(e) => e.target.files?.[0] && loadFile(e.target.files[0])} />
       <button style={S.btn()} onClick={() => document.getElementById('audio-input')?.click()}>
         📂 Load Audio File
       </button>
-
       {file && <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 13, marginLeft: 10 }}>{file.name}</span>}
 
       {error && <div style={{ border: '2px solid #c00', padding: 10, marginTop: 12, fontFamily: 'Poppins, sans-serif', fontSize: 13, color: '#c00' }}>{error}</div>}
@@ -320,43 +452,54 @@ function AudioTrimmer() {
 
       {buffer && (
         <div style={{ marginTop: 16 }}>
-          {/* Waveform */}
-          <canvas ref={waveRef} style={{ width: '100%', height: 80, border: '2px solid #000', display: 'block', marginBottom: 12 }} />
+          {/* Interactive waveform canvas */}
+          <canvas
+            ref={waveRef}
+            style={{ width: '100%', height: 120, border: '2px solid #000', display: 'block', marginBottom: 8, userSelect: 'none' }}
+            onMouseDown={onWaveDown}
+            onMouseMove={onWaveMove}
+            onMouseUp={onWaveUp}
+            onMouseLeave={onWaveUp}
+          />
 
-          {/* Range controls */}
-          <div style={{ display: 'flex', gap: 16, marginBottom: 12, flexWrap: 'wrap' }}>
-            <div style={{ flex: 1, minWidth: 160 }}>
-              <label style={S.label}>Start: {fmt(startSec)}</label>
-              <input
-                type='range'
-                min={0}
-                max={duration}
-                step={0.01}
-                value={startSec}
-                onChange={(e) => setStartSec(Math.min(parseFloat(e.target.value), endSec - 0.1))}
-                style={{ width: '100%' }}
-              />
+          {/* Time readouts + precise number inputs */}
+          <div style={{ display: 'flex', gap: 20, marginBottom: 8, fontFamily: 'Poppins, sans-serif', fontSize: 13, flexWrap: 'wrap', alignItems: 'center' }}>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span style={{ width: 10, height: 10, background: '#0a0', border: '1px solid #444', display: 'inline-block', flexShrink: 0 }} />
+              <strong>Start</strong>
+              <span style={{ fontVariantNumeric: 'tabular-nums', minWidth: 70 }}>{fmt(startSec)}</span>
+              <input type='number' style={numStyle} min={0} max={parseFloat((endSec - 0.01).toFixed(2))} step={0.01}
+                value={parseFloat(startSec.toFixed(2))}
+                onChange={(e) => {
+                  const v = Math.max(0, Math.min(parseFloat(e.target.value) || 0, endRef.current - 0.01));
+                  startRef.current = v; setStartSec(v);
+                }} />
+              <span style={{ fontSize: 11, color: '#666' }}>s</span>
             </div>
-            <div style={{ flex: 1, minWidth: 160 }}>
-              <label style={S.label}>End: {fmt(endSec)}</label>
-              <input
-                type='range'
-                min={0}
-                max={duration}
-                step={0.01}
-                value={endSec}
-                onChange={(e) => setEndSec(Math.max(parseFloat(e.target.value), startSec + 0.1))}
-                style={{ width: '100%' }}
-              />
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span style={{ width: 10, height: 10, background: '#c00', border: '1px solid #444', display: 'inline-block', flexShrink: 0 }} />
+              <strong>End</strong>
+              <span style={{ fontVariantNumeric: 'tabular-nums', minWidth: 70 }}>{fmt(endSec)}</span>
+              <input type='number' style={numStyle} min={parseFloat((startSec + 0.01).toFixed(2))} max={parseFloat(duration.toFixed(2))} step={0.01}
+                value={parseFloat(endSec.toFixed(2))}
+                onChange={(e) => {
+                  const v = Math.max(startRef.current + 0.01, Math.min(parseFloat(e.target.value) || 0, durRef.current));
+                  endRef.current = v; setEndSec(v);
+                }} />
+              <span style={{ fontSize: 11, color: '#666' }}>s</span>
             </div>
           </div>
-          <p style={{ ...S.p, fontSize: 13, color: '#555', marginBottom: 12 }}>
-            Selection: {fmt(startSec)} → {fmt(endSec)} ({(endSec - startSec).toFixed(1)}s of {fmt(duration)})
+          <p style={{ ...S.p, fontSize: 12, color: '#666', marginBottom: 12 }}>
+            Selection: {fmt(startSec)} → {fmt(endSec)} &nbsp;·&nbsp; {(endSec - startSec).toFixed(2)}s of {fmt(duration)}
           </p>
 
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button style={S.btn()} onClick={trim} disabled={loading}>
-              {loading ? 'Processing…' : '✂️ Trim & Export'}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button style={S.btn(previewing ? '#555' : '#000', '#fff')}
+              onClick={previewing ? stopPreview : startPreview} disabled={loading}>
+              {previewing ? '⏹ Stop Preview' : '▶ Preview Selection'}
+            </button>
+            <button style={S.btn('#444', '#fff', loading)} onClick={trim} disabled={loading}>
+              {loading ? 'Processing…' : '✂️ Trim & Export WAV'}
             </button>
             {trimmedUrl && (
               <a href={trimmedUrl} download={`trimmed-${file?.name ?? 'audio'}.wav`}
@@ -368,7 +511,7 @@ function AudioTrimmer() {
 
           {trimmedUrl && (
             <div style={{ marginTop: 12, border: '2px solid #000', padding: 12, background: '#f9f9f9' }}>
-              <p style={{ ...S.p, fontWeight: 700, marginBottom: 8 }}>Preview Trimmed Audio</p>
+              <p style={{ ...S.p, fontWeight: 700, marginBottom: 8 }}>Exported audio</p>
               <audio controls src={trimmedUrl} style={{ width: '100%' }} />
             </div>
           )}
