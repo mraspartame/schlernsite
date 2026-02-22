@@ -131,7 +131,7 @@ export default function PdfEditor() {
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [selectedAnnId, setSelectedAnnId] = useState<string | null>(null);
   const [tool, setTool] = useState<'select' | 'rect' | 'text' | 'image'>('select');
-  const [annColor, setAnnColor] = useState('#ffff00');
+  const [annColor, setAnnColor] = useState('#000000');
   const [annFont, setAnnFont] = useState('Poppins, sans-serif');
   const [textInput, setTextInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -150,6 +150,8 @@ export default function PdfEditor() {
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
   // Cancellation token: increments on each renderAllPages call
   const renderCountRef = useRef(0);
+  // Per-page in-progress pdf.js render task — cancelled before starting a new render on the same canvas
+  const renderTasksRef = useRef<Map<string, any>>(new Map());
 
   // Refs for event handlers
   const annotationsRef = useRef(annotations);   annotationsRef.current = annotations;
@@ -287,7 +289,9 @@ export default function PdfEditor() {
             ctx.fillRect(h.x - 5, h.y - 5, 10, 10);
             ctx.strokeRect(h.x - 5, h.y - 5, 10, 10);
           }
-          // Rotation handle stem + circle (30px above top-center in local space)
+        }
+        // Rotation handle stem + circle (30px above top-center in local space) — all types
+        {
           const rhX = ann.x + ann.w / 2, rhY = ann.y - 3;
           ctx.beginPath();
           ctx.moveTo(rhX, rhY);
@@ -317,6 +321,13 @@ export default function PdfEditor() {
     const overlay = pageOverlayRefs.current.get(entry.id);
     if (!canvas || !overlay) return;
 
+    // Cancel any in-progress pdf.js render on this canvas to avoid concurrent render corruption
+    const existingTask = renderTasksRef.current.get(entry.id);
+    if (existingTask) {
+      try { existingTask.cancel(); } catch { /* ignore */ }
+      renderTasksRef.current.delete(entry.id);
+    }
+
     try {
       let pw: number, ph: number;
       if (entry.pageNum < 1 || !entry.pdfDoc) {
@@ -330,12 +341,23 @@ export default function PdfEditor() {
         const vp = page.getViewport({ scale });
         pw = Math.round(vp.width); ph = Math.round(vp.height);
         canvas.width = pw; canvas.height = ph;
-        await page.render({ canvasContext: canvas.getContext('2d')!, viewport: vp }).promise;
+        const task = page.render({ canvasContext: canvas.getContext('2d')!, viewport: vp });
+        renderTasksRef.current.set(entry.id, task);
+        try {
+          await task.promise;
+        } catch (err: any) {
+          // RenderingCancelledException means a newer render took over — not an error
+          if (err?.name === 'RenderingCancelledException') return;
+          throw err;
+        }
+        renderTasksRef.current.delete(entry.id);
       }
       overlay.width = pw; overlay.height = ph;
       redrawPageOverlay(entry.id);
-    } catch (err) {
-      console.error(`Failed to render page ${entry.pageNum}:`, err);
+    } catch (err: any) {
+      if (err?.name !== 'RenderingCancelledException') {
+        console.error(`Failed to render page ${entry.pageNum}:`, err);
+      }
     }
   }, [redrawPageOverlay]);
 
@@ -492,8 +514,8 @@ export default function PdfEditor() {
       const pageAnns = annotationsRef.current.filter((a) => a.pageId === pageId);
       const selId = selectedAnnRef.current;
       const selAnn = selId ? pageAnns.find((a) => a.id === selId) : null;
-      if (selAnn && selAnn.type !== 'text') {
-        // Rotation handle takes priority
+      if (selAnn) {
+        // Rotation handle takes priority (all annotation types)
         if (annRotationHandleHit(selAnn, pos.x, pos.y)) {
           const cx = selAnn.x + selAnn.w / 2, cy = selAnn.y + selAnn.h / 2;
           ia.mode = 'rotate';
@@ -503,12 +525,15 @@ export default function PdfEditor() {
           ia.startPageId = pageId;
           return;
         }
-        const h = handleAtPoint(selAnn, pos.x, pos.y);
-        if (h) {
-          ia.mode = 'resize'; ia.handle = h;
-          ia.startX = pos.x; ia.startY = pos.y;
-          ia.origAnn = { ...selAnn }; ia.drawing = true;
-          return;
+        // Resize handles only for non-text
+        if (selAnn.type !== 'text') {
+          const h = handleAtPoint(selAnn, pos.x, pos.y);
+          if (h) {
+            ia.mode = 'resize'; ia.handle = h;
+            ia.startX = pos.x; ia.startY = pos.y;
+            ia.origAnn = { ...selAnn }; ia.drawing = true;
+            return;
+          }
         }
       }
       const hit = [...pageAnns].reverse().find((a) => annHitTest(a, pos.x, pos.y));
@@ -913,6 +938,10 @@ export default function PdfEditor() {
                   ))}
                   <input type='color' value={annColor} onChange={(e) => setAnnColor(e.target.value)}
                     style={{ width: 32, height: 28, border: '2px solid #000', cursor: 'pointer', padding: 0 }} title='Color' />
+                  {[['#000000', 'Black'], ['#ff0000', 'Red'], ['#0000ff', 'Blue']].map(([c, label]) => (
+                    <button key={c} onClick={() => setAnnColor(c)} title={label}
+                      style={{ width: 22, height: 22, background: c, border: annColor === c ? '3px solid #0088ff' : '2px solid #ccc', cursor: 'pointer', padding: 0, boxSizing: 'border-box' as const }} />
+                  ))}
                   {tool === 'text' && (
                     <>
                       <input value={textInput} onChange={(e) => setTextInput(e.target.value)}
@@ -1082,8 +1111,7 @@ export default function PdfEditor() {
                       </label>
                     </div>
                   )}
-                  {selAnn.type !== 'text' && (
-                    <div style={{ marginTop: 8 }}>
+                  <div style={{ marginTop: 8 }}>
                       <hr style={{ margin: '6px 0', border: 'none', borderTop: '1px solid #ccc' }} />
                       <label style={S.label}>Rotation: {Math.round(selAnn.rotation ?? 0)}°</label>
                       <input type='range' min={0} max={359} value={Math.round(selAnn.rotation ?? 0)}
@@ -1099,7 +1127,6 @@ export default function PdfEditor() {
                         Snap to 90°
                       </label>
                     </div>
-                  )}
                 </>
               ) : (
                 <p style={{ ...S.p, color: '#888', fontSize: 11 }}>
