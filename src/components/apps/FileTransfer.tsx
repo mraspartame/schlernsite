@@ -83,16 +83,30 @@ function Sender({ onBack }: { onBack: () => void }) {
     if (!file || !connRef.current) return;
     setState('transferring');
     const CHUNK = 64 * 1024;
+    const BUFFER_HIGH = 1024 * 1024; // pause when send buffer exceeds 1 MB
+    const BUFFER_LOW  = 256 * 1024;  // resume once it drains below 256 KB
     const buf = await file.arrayBuffer();
     const total = buf.byteLength;
 
     connRef.current.send(JSON.stringify({ type: 'meta', name: file.name, size: total, mime: file.type }));
 
+    // Access the underlying RTCDataChannel for backpressure control
+    const dc: RTCDataChannel | undefined = connRef.current._dc;
+    if (dc) dc.bufferedAmountLowThreshold = BUFFER_LOW;
+
     for (let offset = 0; offset < total; offset += CHUNK) {
+      // Backpressure: if the send buffer is full, wait for it to drain before sending more.
+      // Without this, large files overflow the buffer and chunks are silently dropped → corruption.
+      if (dc && dc.bufferedAmount > BUFFER_HIGH) {
+        await new Promise<void>((resolve) => {
+          const onLow = () => { dc.removeEventListener('bufferedamountlow', onLow); resolve(); };
+          dc.addEventListener('bufferedamountlow', onLow);
+        });
+      }
       connRef.current.send(buf.slice(offset, offset + CHUNK));
       setProgress(Math.min(100, Math.round(((offset + CHUNK) / total) * 100)));
-      // Yield to avoid blocking — gives browser time to flush the send buffer
-      await new Promise((r) => setTimeout(r, 5));
+      // Yield once per MB to keep the UI responsive
+      if (offset % (1024 * 1024) < CHUNK) await new Promise((r) => setTimeout(r, 0));
     }
 
     connRef.current.send(JSON.stringify({ type: 'done' }));
