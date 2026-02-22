@@ -41,6 +41,7 @@ interface PaintObj {
   src?: string;
   lockAspect?: boolean;  // maintain aspect ratio on resize
   naturalAr?: number;    // natural w/h ratio
+  rotation?: number;     // degrees (0 = upright)
 }
 
 // ── Pure utility functions (outside component) ────────────────────────────────
@@ -69,12 +70,21 @@ function ptSegDist(px: number, py: number, ax: number, ay: number, bx: number, b
 }
 
 function hitTest(o: PaintObj, px: number, py: number): boolean {
+  // Transform click into object's local (unrotated) space
+  let lx = px, ly = py;
+  const rot = o.rotation ?? 0;
+  if (rot !== 0) {
+    const { x, y, w, h } = getDisplayBounds(o);
+    const cx = x + w / 2, cy = y + h / 2;
+    const local = rotatePoint(px, py, cx, cy, toRad(-rot));
+    lx = local.x; ly = local.y;
+  }
   if (o.type === 'line') {
-    const d = ptSegDist(px, py, o.x, o.y, o.x + o.w, o.y + o.h);
+    const d = ptSegDist(lx, ly, o.x, o.y, o.x + o.w, o.y + o.h);
     return d < (o.strokeWidth ?? 2) / 2 + 6;
   }
   const { x, y, w, h } = getDisplayBounds(o);
-  return px >= x - 4 && px <= x + w + 4 && py >= y - 4 && py <= y + h + 4;
+  return lx >= x - 4 && lx <= x + w + 4 && ly >= y - 4 && ly <= y + h + 4;
 }
 
 function getHandles(o: PaintObj): { pos: HandlePos; x: number; y: number }[] {
@@ -98,8 +108,17 @@ function getHandles(o: PaintObj): { pos: HandlePos; x: number; y: number }[] {
 }
 
 function handleAt(o: PaintObj, px: number, py: number): HandlePos | null {
+  // Transform into local space before checking resize handles
+  let lx = px, ly = py;
+  const rot = o.rotation ?? 0;
+  if (rot !== 0) {
+    const { x, y, w, h } = getDisplayBounds(o);
+    const cx = x + w / 2, cy = y + h / 2;
+    const local = rotatePoint(px, py, cx, cy, toRad(-rot));
+    lx = local.x; ly = local.y;
+  }
   for (const h of getHandles(o)) {
-    if (Math.abs(px - h.x) < HANDLE_R && Math.abs(py - h.y) < HANDLE_R) return h.pos;
+    if (Math.abs(lx - h.x) < HANDLE_R && Math.abs(ly - h.y) < HANDLE_R) return h.pos;
   }
   return null;
 }
@@ -138,11 +157,42 @@ function measureText(text: string, fontSize: number, fontFamily = 'Poppins, sans
   return { w: Math.ceil(c.measureText(text).width), h: Math.ceil(fontSize * 1.4) };
 }
 
+// ── Rotation helpers ───────────────────────────────────────────────────────────
+
+function toRad(deg: number) { return deg * Math.PI / 180; }
+
+function rotatePoint(px: number, py: number, cx: number, cy: number, rad: number) {
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+  return { x: (px - cx) * cos - (py - cy) * sin + cx, y: (px - cx) * sin + (py - cy) * cos + cy };
+}
+
+/** World-space position of the rotation handle circle (30px above top-center, rotated with object). */
+function getRotationHandle(o: PaintObj): { x: number; y: number } {
+  const { x, y, w, h } = getDisplayBounds(o);
+  const cx = x + w / 2, cy = y + h / 2;
+  return rotatePoint(cx, cy - h / 2 - 30, cx, cy, toRad(o.rotation ?? 0));
+}
+
+function rotationHandleHit(o: PaintObj, px: number, py: number): boolean {
+  const rh = getRotationHandle(o);
+  return Math.hypot(px - rh.x, py - rh.y) < HANDLE_R + 4;
+}
+
 function drawObj(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<string, HTMLImageElement>) {
   ctx.save();
   ctx.globalAlpha = o.opacity;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
+
+  // Apply rotation around the object's center
+  const rot = o.rotation ?? 0;
+  if (rot !== 0) {
+    const { x, y, w, h } = getDisplayBounds(o);
+    const cx = x + w / 2, cy = y + h / 2;
+    ctx.translate(cx, cy);
+    ctx.rotate(toRad(rot));
+    ctx.translate(-cx, -cy);
+  }
 
   switch (o.type) {
     case 'rect':
@@ -280,6 +330,7 @@ export default function PaintEditor() {
   const [fontSize, setFontSize] = useState(24);
   const [fontFamily, setFontFamily] = useState('Poppins, sans-serif');
   const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const [snapRotation, setSnapRotation] = useState(true);
 
   // ── Refs (always-fresh values for event callbacks) ─────────────────────────
   const layersRef = useRef(layers);           layersRef.current = layers;
@@ -311,9 +362,12 @@ export default function PaintEditor() {
   const pixelSnapshot = useRef<ImageData | null>(null);
 
   // For select tool drag
-  const dragMode = useRef<'move' | 'resize' | null>(null);
+  const dragMode = useRef<'move' | 'resize' | 'rotate' | null>(null);
   const dragHandle = useRef<HandlePos | null>(null);
   const dragOrigObj = useRef<PaintObj | null>(null);
+  const dragStartAngle = useRef(0);
+  const dragStartRotation = useRef(0);
+  const snapToRef = useRef(snapRotation); snapToRef.current = snapRotation;
 
   // For text cursor preview
   const cursorPos = useRef<{ x: number; y: number } | null>(null);
@@ -374,25 +428,54 @@ export default function PaintEditor() {
     // Overlay: selection handles + shape/text preview
     overlay.clearRect(0, 0, W, H);
 
-    // Draw selected object highlight
+    // Draw selected object highlight (rotated with the object)
     if (currentSelectedId) {
       const sel = currentObjects.find((o) => o.id === currentSelectedId);
       if (sel) {
         const { x, y, w, h } = getDisplayBounds(sel);
+        const cx = x + w / 2, cy = y + h / 2;
+        const rad = toRad(sel.rotation ?? 0);
+
         overlay.save();
+        // Rotate the entire selection UI around the object's center
+        overlay.translate(cx, cy);
+        overlay.rotate(rad);
+        overlay.translate(-cx, -cy);
+
+        // Dashed selection rect
         overlay.strokeStyle = '#0088ff';
         overlay.lineWidth = 1.5;
         overlay.setLineDash([5, 3]);
         overlay.strokeRect(x - 2, y - 2, w + 4, h + 4);
         overlay.setLineDash([]);
-        // Handles
+
+        // Resize handles
         overlay.fillStyle = '#fff';
         overlay.strokeStyle = '#0088ff';
         overlay.lineWidth = 1.5;
-        for (const h of getHandles(sel)) {
-          overlay.fillRect(h.x - HANDLE_SZ / 2, h.y - HANDLE_SZ / 2, HANDLE_SZ, HANDLE_SZ);
-          overlay.strokeRect(h.x - HANDLE_SZ / 2, h.y - HANDLE_SZ / 2, HANDLE_SZ, HANDLE_SZ);
+        for (const handle of getHandles(sel)) {
+          overlay.fillRect(handle.x - HANDLE_SZ / 2, handle.y - HANDLE_SZ / 2, HANDLE_SZ, HANDLE_SZ);
+          overlay.strokeRect(handle.x - HANDLE_SZ / 2, handle.y - HANDLE_SZ / 2, HANDLE_SZ, HANDLE_SZ);
         }
+
+        // Rotation handle — stem line then circle, 30px above top-center in local space
+        const rhX = x + w / 2, rhY = y - 2;
+        overlay.beginPath();
+        overlay.moveTo(rhX, rhY);
+        overlay.lineTo(rhX, rhY - 28);
+        overlay.setLineDash([3, 2]);
+        overlay.strokeStyle = '#0088ff';
+        overlay.lineWidth = 1;
+        overlay.stroke();
+        overlay.setLineDash([]);
+        overlay.beginPath();
+        overlay.arc(rhX, rhY - 28, 6, 0, Math.PI * 2);
+        overlay.fillStyle = '#fff';
+        overlay.fill();
+        overlay.strokeStyle = '#0088ff';
+        overlay.lineWidth = 1.5;
+        overlay.stroke();
+
         overlay.restore();
       }
     }
@@ -546,6 +629,17 @@ export default function PaintEditor() {
         : null;
 
       if (sel) {
+        // Rotation handle takes priority
+        if (rotationHandleHit(sel, pos.x, pos.y)) {
+          saveHistory();
+          dragMode.current = 'rotate';
+          dragOrigObj.current = { ...sel };
+          const { x, y, w, h } = getDisplayBounds(sel);
+          const cx = x + w / 2, cy = y + h / 2;
+          dragStartAngle.current = Math.atan2(pos.y - cy, pos.x - cx);
+          dragStartRotation.current = sel.rotation ?? 0;
+          return;
+        }
         const h = handleAt(sel, pos.x, pos.y);
         if (h) {
           saveHistory();
@@ -664,7 +758,8 @@ export default function PaintEditor() {
           : null;
         const canvas = overlayRef.current;
         if (canvas) {
-          if (sel && handleAt(sel, pos.x, pos.y)) canvas.style.cursor = 'crosshair';
+          if (sel && rotationHandleHit(sel, pos.x, pos.y)) canvas.style.cursor = 'grab';
+          else if (sel && handleAt(sel, pos.x, pos.y)) canvas.style.cursor = 'crosshair';
           else if (objectsRef.current.find((o) => hitTest(o, pos.x, pos.y))) canvas.style.cursor = 'move';
           else canvas.style.cursor = 'default';
         }
@@ -692,6 +787,26 @@ export default function PaintEditor() {
       const dx = pos.x - (lastPos.current?.x ?? pos.x);
       const dy = pos.y - (lastPos.current?.y ?? pos.y);
       lastPos.current = pos;
+
+      // Rotation drag — computed from angle to object center
+      if (dragMode.current === 'rotate' && dragOrigObj.current) {
+        const orig = dragOrigObj.current;
+        const { x, y, w, h } = getDisplayBounds(orig);
+        const cx = x + w / 2, cy = y + h / 2;
+        const angle = Math.atan2(pos.y - cy, pos.x - cx);
+        const delta = (angle - dragStartAngle.current) * 180 / Math.PI;
+        let newRot = ((dragStartRotation.current + delta) % 360 + 360) % 360;
+        // Snap within 8° of any 90° multiple
+        if (snapToRef.current) {
+          const nearest = Math.round(newRot / 90) * 90 % 360;
+          if (Math.abs(newRot - nearest) < 8) newRot = nearest;
+        }
+        const objs = objectsRef.current.map((o) => o.id === selId ? { ...o, rotation: newRot } : o);
+        objectsRef.current = objs;
+        setObjects(objs);
+        renderAll(layersRef.current, objs, selId);
+        return;
+      }
 
       const objs = objectsRef.current.map((o) => {
         if (o.id !== selId) return o;
@@ -1163,6 +1278,21 @@ export default function PaintEditor() {
               <input type='range' min={0} max={100} value={Math.round((selObj.opacity ?? 1) * 100)}
                 onChange={(e) => updateSelectedObj({ opacity: parseInt(e.target.value) / 100 })}
                 style={{ width: '100%' }} />
+
+              <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
+              <label style={S.label}>Rotation: {Math.round(selObj.rotation ?? 0)}°</label>
+              <input type='range' min={0} max={359} value={Math.round(selObj.rotation ?? 0)}
+                onChange={(e) => updateSelectedObj({ rotation: parseInt(e.target.value) })}
+                style={{ width: '100%' }} />
+              <div style={{ display: 'flex', gap: 3, marginBottom: 4, flexWrap: 'wrap' }}>
+                {[0, 90, 180, 270].map((a) => (
+                  <button key={a} style={S.smallBtn()} onClick={() => updateSelectedObj({ rotation: a })}>{a}°</button>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 4, ...S.label, cursor: 'pointer', marginBottom: 0 }}>
+                <input type='checkbox' checked={snapRotation} onChange={(e) => setSnapRotation(e.target.checked)} />
+                Snap to 90°
+              </label>
             </>
           ) : (
             <>

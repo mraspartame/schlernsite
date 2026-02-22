@@ -24,6 +24,7 @@ interface Annotation {
   text?: string;
   fontFamily?: string;
   imageSrc?: string;
+  rotation?: number;   // degrees (0 = upright)
 }
 
 const FONTS = [
@@ -59,6 +60,26 @@ const uid = () => Math.random().toString(36).slice(2, 8);
 
 const HANDLE_R = 8;
 
+// ── Rotation helpers ───────────────────────────────────────────────────────────
+
+function toRad(deg: number) { return deg * Math.PI / 180; }
+
+function rotatePoint(px: number, py: number, cx: number, cy: number, rad: number) {
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+  return { x: (px - cx) * cos - (py - cy) * sin + cx, y: (px - cx) * sin + (py - cy) * cos + cy };
+}
+
+/** World-space position of the rotation handle circle (30px above top-center, rotated with annotation). */
+function getAnnRotationHandle(ann: Annotation): { x: number; y: number } {
+  const cx = ann.x + ann.w / 2, cy = ann.y + ann.h / 2;
+  return rotatePoint(cx, cy - ann.h / 2 - 30, cx, cy, toRad(ann.rotation ?? 0));
+}
+
+function annRotationHandleHit(ann: Annotation, px: number, py: number): boolean {
+  const rh = getAnnRotationHandle(ann);
+  return Math.hypot(px - rh.x, py - rh.y) < HANDLE_R + 4;
+}
+
 function getHandlePositions(ann: Annotation) {
   const { x, y, w, h } = ann;
   return [
@@ -70,20 +91,36 @@ function getHandlePositions(ann: Annotation) {
 }
 
 function handleAtPoint(ann: Annotation, px: number, py: number): string | null {
+  // Transform into local (unrotated) space before checking handles
+  let lx = px, ly = py;
+  const rot = ann.rotation ?? 0;
+  if (rot !== 0) {
+    const cx = ann.x + ann.w / 2, cy = ann.y + ann.h / 2;
+    const local = rotatePoint(px, py, cx, cy, toRad(-rot));
+    lx = local.x; ly = local.y;
+  }
   for (const h of getHandlePositions(ann)) {
-    if (Math.abs(px - h.x) < HANDLE_R && Math.abs(py - h.y) < HANDLE_R) return h.pos;
+    if (Math.abs(lx - h.x) < HANDLE_R && Math.abs(ly - h.y) < HANDLE_R) return h.pos;
   }
   return null;
 }
 
 function annHitTest(ann: Annotation, px: number, py: number): boolean {
+  // Transform into local (unrotated) space
+  let lx = px, ly = py;
+  const rot = ann.rotation ?? 0;
+  if (rot !== 0) {
+    const cx = ann.x + ann.w / 2, cy = ann.y + ann.h / 2;
+    const local = rotatePoint(px, py, cx, cy, toRad(-rot));
+    lx = local.x; ly = local.y;
+  }
   if (ann.type === 'rect') {
     const bw = 6;
-    return px >= ann.x - bw && px <= ann.x + ann.w + bw &&
-           py >= ann.y - bw && py <= ann.y + ann.h + bw;
+    return lx >= ann.x - bw && lx <= ann.x + ann.w + bw &&
+           ly >= ann.y - bw && ly <= ann.y + ann.h + bw;
   }
-  return px >= ann.x - 4 && px <= ann.x + ann.w + 4 &&
-         py >= ann.y - 4 && py <= ann.y + ann.h + 4;
+  return lx >= ann.x - 4 && lx <= ann.x + ann.w + 4 &&
+         ly >= ann.y - 4 && ly <= ann.y + ann.h + 4;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -123,15 +160,20 @@ export default function PdfEditor() {
   const textInputRef = useRef(textInput);       textInputRef.current = textInput;
   const activePageRef = useRef(activePage);     activePageRef.current = activePage;
 
+  const [snapRotation, setSnapRotation] = useState(true);
+  const snapToRef = useRef(snapRotation); snapToRef.current = snapRotation;
+
   // Interaction state
   const interactRef = useRef<{
-    mode: 'create-rect' | 'move' | 'resize' | null;
+    mode: 'create-rect' | 'move' | 'resize' | 'rotate' | null;
     handle: string | null;
     startX: number; startY: number;
     startPageId: string | null;
     origAnn: Annotation | null;
     drawing: boolean;
-  }>({ mode: null, handle: null, startX: 0, startY: 0, startPageId: null, origAnn: null, drawing: false });
+    startAngle: number;
+    startRotation: number;
+  }>({ mode: null, handle: null, startX: 0, startY: 0, startPageId: null, origAnn: null, drawing: false, startAngle: 0, startRotation: 0 });
 
   // ── Load PDF.js (CDN, avoids bundler/worker issues) ───────────────────────
 
@@ -185,7 +227,17 @@ export default function PdfEditor() {
     const selId = selectedAnnRef.current;
 
     for (const ann of anns) {
+      const rot = ann.rotation ?? 0;
+      const cx = ann.x + ann.w / 2, cy = ann.y + ann.h / 2;
+
       ctx.save();
+      // Apply rotation around the annotation's center
+      if (rot !== 0) {
+        ctx.translate(cx, cy);
+        ctx.rotate(toRad(rot));
+        ctx.translate(-cx, -cy);
+      }
+
       if (ann.type === 'rect') {
         ctx.globalAlpha = 0.35;
         ctx.fillStyle = ann.color;
@@ -216,6 +268,12 @@ export default function PdfEditor() {
 
       if (selId === ann.id) {
         ctx.save();
+        // Rotate selection UI with the annotation
+        if (rot !== 0) {
+          ctx.translate(cx, cy);
+          ctx.rotate(toRad(rot));
+          ctx.translate(-cx, -cy);
+        }
         ctx.strokeStyle = '#0088ff';
         ctx.lineWidth = 2;
         ctx.setLineDash([5, 3]);
@@ -229,6 +287,23 @@ export default function PdfEditor() {
             ctx.fillRect(h.x - 5, h.y - 5, 10, 10);
             ctx.strokeRect(h.x - 5, h.y - 5, 10, 10);
           }
+          // Rotation handle stem + circle (30px above top-center in local space)
+          const rhX = ann.x + ann.w / 2, rhY = ann.y - 3;
+          ctx.beginPath();
+          ctx.moveTo(rhX, rhY);
+          ctx.lineTo(rhX, rhY - 28);
+          ctx.setLineDash([3, 2]);
+          ctx.strokeStyle = '#0088ff';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.arc(rhX, rhY - 28, 6, 0, Math.PI * 2);
+          ctx.fillStyle = '#fff';
+          ctx.fill();
+          ctx.strokeStyle = '#0088ff';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
         }
         ctx.restore();
       }
@@ -418,6 +493,16 @@ export default function PdfEditor() {
       const selId = selectedAnnRef.current;
       const selAnn = selId ? pageAnns.find((a) => a.id === selId) : null;
       if (selAnn && selAnn.type !== 'text') {
+        // Rotation handle takes priority
+        if (annRotationHandleHit(selAnn, pos.x, pos.y)) {
+          const cx = selAnn.x + selAnn.w / 2, cy = selAnn.y + selAnn.h / 2;
+          ia.mode = 'rotate';
+          ia.startAngle = Math.atan2(pos.y - cy, pos.x - cx);
+          ia.startRotation = selAnn.rotation ?? 0;
+          ia.origAnn = { ...selAnn }; ia.drawing = true;
+          ia.startPageId = pageId;
+          return;
+        }
         const h = handleAtPoint(selAnn, pos.x, pos.y);
         if (h) {
           ia.mode = 'resize'; ia.handle = h;
@@ -473,6 +558,23 @@ export default function PdfEditor() {
         ctx.strokeRect(x, y, w, h);
         ctx.restore();
       }
+      return;
+    }
+
+    if (ia.mode === 'rotate' && ia.origAnn) {
+      const orig = ia.origAnn;
+      const cx = orig.x + orig.w / 2, cy = orig.y + orig.h / 2;
+      const angle = Math.atan2(pos.y - cy, pos.x - cx);
+      const delta = (angle - ia.startAngle) * 180 / Math.PI;
+      let newRot = ((ia.startRotation + delta) % 360 + 360) % 360;
+      // Snap within 8° of any 90° multiple
+      if (snapToRef.current) {
+        const nearest = Math.round(newRot / 90) * 90 % 360;
+        if (Math.abs(newRot - nearest) < 8) newRot = nearest;
+      }
+      const next = annotationsRef.current.map((a) => a.id === orig.id ? { ...a, rotation: newRot } : a);
+      annotationsRef.current = next;
+      setAnnotations(next);
       return;
     }
 
@@ -673,6 +775,14 @@ export default function PdfEditor() {
 
         pageAnns.forEach((ann) => {
           ctx.save();
+          const rot = ann.rotation ?? 0;
+          if (rot !== 0) {
+            const annCX = (ann.x + ann.w / 2) * scaleX;
+            const annCY = (ann.y + ann.h / 2) * scaleY;
+            ctx.translate(annCX, annCY);
+            ctx.rotate(toRad(rot));
+            ctx.translate(-annCX, -annCY);
+          }
           if (ann.type === 'rect') {
             ctx.globalAlpha = 0.35;
             ctx.fillStyle = ann.color;
@@ -969,6 +1079,24 @@ export default function PdfEditor() {
                         <input type='checkbox' checked={selAnn.lockAspect ?? false}
                           onChange={(e) => updateSelAnn({ lockAspect: e.target.checked })} />
                         Lock aspect ratio
+                      </label>
+                    </div>
+                  )}
+                  {selAnn.type !== 'text' && (
+                    <div style={{ marginTop: 8 }}>
+                      <hr style={{ margin: '6px 0', border: 'none', borderTop: '1px solid #ccc' }} />
+                      <label style={S.label}>Rotation: {Math.round(selAnn.rotation ?? 0)}°</label>
+                      <input type='range' min={0} max={359} value={Math.round(selAnn.rotation ?? 0)}
+                        onChange={(e) => updateSelAnn({ rotation: parseInt(e.target.value) })}
+                        style={{ width: '100%', marginBottom: 4 }} />
+                      <div style={{ display: 'flex', gap: 3, marginBottom: 6, flexWrap: 'wrap' }}>
+                        {[0, 90, 180, 270].map((a) => (
+                          <button key={a} style={S.btn('#fff', '#000')} onClick={() => updateSelAnn({ rotation: a })}>{a}°</button>
+                        ))}
+                      </div>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                        <input type='checkbox' checked={snapRotation} onChange={(e) => setSnapRotation(e.target.checked)} />
+                        Snap to 90°
                       </label>
                     </div>
                   )}
