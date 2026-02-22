@@ -67,7 +67,7 @@ function Sender({ onBack }: { onBack: () => void }) {
       const peer = new Peer();
       peerRef.current = peer;
       peer.on('open', () => {
-        const conn = peer.connect(info.id, { reliable: true });
+        const conn = peer.connect(info.id, { reliable: true, serialization: 'raw' });
         connRef.current = conn;
         conn.on('open', () => setState('connected'));
         conn.on('error', (e: any) => { setError(String(e)); setState('error'); });
@@ -82,9 +82,9 @@ function Sender({ onBack }: { onBack: () => void }) {
   const sendFile = async () => {
     if (!file || !connRef.current) return;
     setState('transferring');
-    const CHUNK = 64 * 1024;
-    const BUFFER_HIGH = 1024 * 1024; // pause when send buffer exceeds 1 MB
-    const BUFFER_LOW  = 256 * 1024;  // resume once it drains below 256 KB
+    const CHUNK       = 256 * 1024;       // 256 KB — fewer send() calls, less JS overhead
+    const BUFFER_HIGH = 16 * 1024 * 1024; // pause when send buffer exceeds 16 MB
+    const BUFFER_LOW  =  4 * 1024 * 1024; // resume once it drains below 4 MB
     const buf = await file.arrayBuffer();
     const total = buf.byteLength;
 
@@ -104,9 +104,12 @@ function Sender({ onBack }: { onBack: () => void }) {
         });
       }
       connRef.current.send(buf.slice(offset, offset + CHUNK));
-      setProgress(Math.min(100, Math.round(((offset + CHUNK) / total) * 100)));
-      // Yield once per MB to keep the UI responsive
-      if (offset % (1024 * 1024) < CHUNK) await new Promise((r) => setTimeout(r, 0));
+      // Update UI every 4 MB (not every chunk) — excessive setState calls block the main thread
+      if (offset % (4 * 1024 * 1024) < CHUNK || offset + CHUNK >= total) {
+        setProgress(Math.min(100, Math.round(((offset + CHUNK) / total) * 100)));
+      }
+      // Yield every 16 MB to keep the page responsive without adding significant latency
+      if (offset % (16 * 1024 * 1024) < CHUNK) await new Promise((r) => setTimeout(r, 0));
     }
 
     connRef.current.send(JSON.stringify({ type: 'done' }));
@@ -172,6 +175,8 @@ function Receiver({ onBack }: { onBack: () => void }) {
   const peerRef = useRef<any>(null);
   const chunksRef = useRef<ArrayBuffer[]>([]);
   const metaRef = useRef<{ name: string; size: number; mime: string } | null>(null);
+  const receivedBytesRef = useRef(0);
+  const lastReportedRef = useRef(0);
 
   const start = useCallback(async () => {
     setState('connecting');
@@ -197,6 +202,8 @@ function Receiver({ onBack }: { onBack: () => void }) {
                 setFileName(msg.name);
                 setFileSize(msg.size);
                 chunksRef.current = [];
+                receivedBytesRef.current = 0;
+                lastReportedRef.current = 0;
                 setReceived(0);
                 setState('transferring');
               } else if (msg.type === 'done') {
@@ -209,7 +216,14 @@ function Receiver({ onBack }: { onBack: () => void }) {
             // Binary chunk — handle both ArrayBuffer and Uint8Array
             const chunk = data instanceof ArrayBuffer ? data : (data as Uint8Array).buffer.slice(0) as ArrayBuffer;
             chunksRef.current.push(chunk);
-            setReceived((prev) => prev + chunk.byteLength);
+            receivedBytesRef.current += chunk.byteLength;
+            // Update UI every 4 MB to avoid re-renders throttling the transfer
+            const REPORT_EVERY = 4 * 1024 * 1024;
+            if (receivedBytesRef.current - lastReportedRef.current >= REPORT_EVERY ||
+                receivedBytesRef.current >= (metaRef.current?.size ?? 0)) {
+              lastReportedRef.current = receivedBytesRef.current;
+              setReceived(receivedBytesRef.current);
+            }
           }
         });
         conn.on('error', (e: any) => { setError(String(e)); setState('error'); });
