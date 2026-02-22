@@ -4,7 +4,9 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 
 interface PageEntry {
   id: string;
-  pageNum: number;
+  pdfDoc: any | null;    // pdf.js document (null for blank pages)
+  pdfFile: File | null;  // source File for pdf-lib save (null for blank pages)
+  pageNum: number;       // 1-indexed; -1 for blank pages
   thumbnail: string;
 }
 
@@ -36,7 +38,6 @@ const PAGE_GAP = 14;
 
 const S = {
   card: { border: '3px solid #000', background: '#fff', padding: '14px', marginBottom: '12px', boxShadow: '4px 4px 0 #000' } as React.CSSProperties,
-  h1: { fontFamily: 'DM Serif Text, serif', fontSize: 32, marginBottom: 6 } as React.CSSProperties,
   h2: { fontFamily: 'DM Serif Text, serif', fontSize: 18, marginBottom: 8 } as React.CSSProperties,
   label: { display: 'block', fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 11, marginBottom: 3 } as React.CSSProperties,
   p: { fontFamily: 'Poppins, sans-serif', fontSize: 13 } as React.CSSProperties,
@@ -46,6 +47,12 @@ const S = {
     cursor: disabled ? 'not-allowed' : 'pointer', boxShadow: disabled ? 'none' : '2px 2px 0 #000',
     marginRight: 6, marginBottom: 4,
   } as React.CSSProperties),
+};
+
+// Wide button variant for the right panel
+const wideBtn: React.CSSProperties = {
+  display: 'block', width: '100%', boxSizing: 'border-box',
+  textAlign: 'center', marginBottom: 4, marginRight: 0,
 };
 
 const uid = () => Math.random().toString(36).slice(2, 8);
@@ -96,13 +103,13 @@ export default function PdfEditor() {
   const [saving, setSaving] = useState(false);
   const [viewScale, setViewScale] = useState(1);
 
-  const pdfDocRef = useRef<any>(null);
+  const fileRef = useRef<File | null>(null);
+  const firstPageWidthRef = useRef<number | null>(null);
   // Per-page canvas refs — populated via callback refs in JSX
   const pageCanvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const pageOverlayRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const pageDivRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const fileRef = useRef<File | null>(null);
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
   // Cancellation token: increments on each renderAllPages call
   const renderCountRef = useRef(0);
@@ -126,7 +133,7 @@ export default function PdfEditor() {
     drawing: boolean;
   }>({ mode: null, handle: null, startX: 0, startY: 0, startPageId: null, origAnn: null, drawing: false });
 
-  // ── Load PDF.js (CDN, avoids bundler/worker issues) ──────────────────────
+  // ── Load PDF.js (CDN, avoids bundler/worker issues) ───────────────────────
 
   const loadPdfjsLib = useCallback(() => {
     return new Promise<any>((resolve, reject) => {
@@ -143,6 +150,28 @@ export default function PdfEditor() {
       document.head.appendChild(script);
     });
   }, []);
+
+  // ── Fit to width ──────────────────────────────────────────────────────────
+
+  const fitToWidth = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const natW = firstPageWidthRef.current ?? 595;
+    const available = container.clientWidth - 24; // 12px padding each side in the content div
+    if (available > 0 && natW > 0) {
+      const scale = Math.max(0.25, Math.min(2.5, parseFloat((available / natW).toFixed(2))));
+      setViewScale(scale);
+    }
+  }, []);
+
+  // Auto-fit when pages are first loaded (transition from 0 → N)
+  const prevPagesLenRef = useRef(0);
+  useEffect(() => {
+    if (prevPagesLenRef.current === 0 && pages.length > 0) {
+      setTimeout(fitToWidth, 50); // wait for DOM layout after React renders the scroll container
+    }
+    prevPagesLenRef.current = pages.length;
+  }, [pages.length, fitToWidth]);
 
   // ── Per-page overlay drawing ───────────────────────────────────────────────
 
@@ -209,22 +238,20 @@ export default function PdfEditor() {
   // ── Render one page to its canvas ─────────────────────────────────────────
 
   const renderOnePage = useCallback(async (entry: PageEntry, scale: number) => {
-    const doc = pdfDocRef.current;
-    if (!doc) return;
     const canvas = pageCanvasRefs.current.get(entry.id);
     const overlay = pageOverlayRefs.current.get(entry.id);
     if (!canvas || !overlay) return;
 
     try {
       let pw: number, ph: number;
-      if (entry.pageNum < 1) {
+      if (entry.pageNum < 1 || !entry.pdfDoc) {
         pw = Math.round(595 * scale); ph = Math.round(842 * scale);
         canvas.width = pw; canvas.height = ph;
         const ctx = canvas.getContext('2d')!;
         ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, pw, ph);
       } else {
-        const page = await doc.getPage(entry.pageNum);
+        const page = await entry.pdfDoc.getPage(entry.pageNum);
         const vp = page.getViewport({ scale });
         pw = Math.round(vp.width); ph = Math.round(vp.height);
         canvas.width = pw; canvas.height = ph;
@@ -254,7 +281,7 @@ export default function PdfEditor() {
 
   // Re-render pages when page list or zoom changes
   useEffect(() => {
-    if (pdfDocRef.current && pages.length > 0) {
+    if (pages.length > 0) {
       renderAllPages(pages, viewScale);
     }
   }, [pages, viewScale, renderAllPages]);
@@ -270,6 +297,7 @@ export default function PdfEditor() {
     setAnnotations([]);
     setSelectedAnnId(null);
     fileRef.current = file;
+    firstPageWidthRef.current = null;
     pageCanvasRefs.current.clear();
     pageOverlayRefs.current.clear();
     pageDivRefs.current.clear();
@@ -278,16 +306,16 @@ export default function PdfEditor() {
       const pdfjsLib = await loadPdfjsLib();
       const arrayBuffer = await file.arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      pdfDocRef.current = pdf;
 
       const entries: PageEntry[] = [];
       for (let i = 1; i <= pdf.numPages; i++) {
         const page = await pdf.getPage(i);
+        if (i === 1) firstPageWidthRef.current = page.getViewport({ scale: 1 }).width;
         const vp = page.getViewport({ scale: 0.25 });
         const c = document.createElement('canvas');
         c.width = vp.width; c.height = vp.height;
         await page.render({ canvasContext: c.getContext('2d')!, viewport: vp }).promise;
-        entries.push({ id: uid(), pageNum: i, thumbnail: c.toDataURL('image/jpeg', 0.65) });
+        entries.push({ id: uid(), pdfDoc: pdf, pdfFile: file, pageNum: i, thumbnail: c.toDataURL('image/jpeg', 0.65) });
         setLoadProgress(Math.round((i / pdf.numPages) * 100));
       }
 
@@ -295,6 +323,43 @@ export default function PdfEditor() {
       if (entries.length > 0) setActivePage(entries[0].id);
     } catch (e: any) {
       setError('Failed to load PDF: ' + (e.message ?? String(e)));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Add another PDF (combine) ─────────────────────────────────────────────
+
+  const addPdf = async (file: File) => {
+    setError(null);
+    setLoading(true);
+    setLoadProgress(0);
+    try {
+      const pdfjsLib = await loadPdfjsLib();
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+      const newEntries: PageEntry[] = [];
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const vp = page.getViewport({ scale: 0.25 });
+        const c = document.createElement('canvas');
+        c.width = vp.width; c.height = vp.height;
+        await page.render({ canvasContext: c.getContext('2d')!, viewport: vp }).promise;
+        newEntries.push({ id: uid(), pdfDoc: pdf, pdfFile: file, pageNum: i, thumbnail: c.toDataURL('image/jpeg', 0.65) });
+        setLoadProgress(Math.round((i / pdf.numPages) * 100));
+      }
+
+      // Insert pages after the currently active page (or at end if none)
+      setPages((prev) => {
+        const idx = activePageRef.current ? prev.findIndex((p) => p.id === activePageRef.current) : prev.length - 1;
+        const insertAt = idx === -1 ? prev.length : idx + 1;
+        const next = [...prev];
+        next.splice(insertAt, 0, ...newEntries);
+        return next;
+      });
+    } catch (e: any) {
+      setError('Failed to add PDF: ' + (e.message ?? String(e)));
     } finally {
       setLoading(false);
     }
@@ -521,7 +586,16 @@ export default function PdfEditor() {
 
   const addBlankPage = () => {
     const id = uid();
-    setPages((p) => [...p, { id, pageNum: -1, thumbnail: '' }]);
+    setPages((prev) => {
+      // Insert after the currently active page
+      const idx = activePageRef.current ? prev.findIndex((p) => p.id === activePageRef.current) : prev.length - 1;
+      const insertAt = idx === -1 ? prev.length : idx + 1;
+      const next = [...prev];
+      next.splice(insertAt, 0, { id, pdfDoc: null, pdfFile: null, pageNum: -1, thumbnail: '' });
+      return next;
+    });
+    setActivePage(id);
+    activePageRef.current = id;
   };
 
   const clearPageAnnotations = () => {
@@ -550,34 +624,44 @@ export default function PdfEditor() {
   // ── Save PDF ──────────────────────────────────────────────────────────────
 
   const savePdf = async () => {
-    if (!pdfDocRef.current || !fileRef.current) return;
+    if (!fileRef.current || pages.length === 0) return;
     setSaving(true);
     try {
       const { PDFDocument } = await import('pdf-lib');
-      const originalBytes = await fileRef.current.arrayBuffer();
-      const srcDoc = await PDFDocument.load(originalBytes);
       const newDoc = await PDFDocument.create();
 
+      // Cache pdf-lib documents by source File to avoid re-loading the same file multiple times
+      const pdfLibDocCache = new Map<File, any>();
+      const getPdfLibDoc = async (file: File) => {
+        if (!pdfLibDocCache.has(file)) {
+          const bytes = await file.arrayBuffer();
+          pdfLibDocCache.set(file, await PDFDocument.load(bytes));
+        }
+        return pdfLibDocCache.get(file)!;
+      };
+
+      // First pass: copy / create all pages
       for (const entry of pages) {
-        if (entry.pageNum === -1) {
+        if (entry.pageNum === -1 || !entry.pdfFile) {
           newDoc.addPage([595, 842]);
         } else {
+          const srcDoc = await getPdfLibDoc(entry.pdfFile);
           const [copied] = await newDoc.copyPages(srcDoc, [entry.pageNum - 1]);
           newDoc.addPage(copied);
         }
       }
 
+      // Second pass: bake annotations onto their pages
       for (let i = 0; i < pages.length; i++) {
         const entry = pages[i];
         const pageAnns = annotations.filter((a) => a.pageId === entry.id);
-        if (pageAnns.length === 0) continue;
-        if (entry.pageNum < 1) continue;
+        if (pageAnns.length === 0 || entry.pageNum < 1 || !entry.pdfDoc) continue;
 
         const pdfPage = newDoc.getPage(i);
         const { width, height } = pdfPage.getSize();
         const SCALE = 2;
 
-        const srcPage = await pdfDocRef.current.getPage(entry.pageNum);
+        const srcPage = await entry.pdfDoc.getPage(entry.pageNum);
         const vp = srcPage.getViewport({ scale: SCALE });
         const c = document.createElement('canvas');
         c.width = vp.width; c.height = vp.height;
@@ -663,36 +747,13 @@ export default function PdfEditor() {
 
   return (
     <div style={{ maxWidth: 1400, margin: '0 auto' }}>
-      {/* Header */}
-      <div style={S.card}>
-        <h1 style={S.h1}>📄 PDF Editor</h1>
-        <p style={S.p}>Load a PDF to reorder/delete pages, add highlight boxes, text labels, and images, then save.</p>
-        <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-          <label style={{ ...S.btn(), cursor: 'pointer', display: 'inline-block' }}>
-            📂 Open PDF
-            <input type='file' accept='application/pdf' style={{ display: 'none' }}
-              onChange={(e) => e.target.files?.[0] && loadPdf(e.target.files[0])} />
-          </label>
-          {pages.length > 0 && (
-            <>
-              <button style={S.btn('#fff', '#000')} onClick={addBlankPage}>+ Blank page</button>
-              <button style={S.btn('#0a0', '#fff', saving)} onClick={savePdf} disabled={saving}>
-                {saving ? 'Saving…' : '⬇ Save PDF'}
-              </button>
-            </>
-          )}
-        </div>
-        {loading && <p style={{ ...S.p, marginTop: 8, color: '#555' }}>Loading… {loadProgress}%</p>}
-        {error && <p style={{ ...S.p, color: '#c00', marginTop: 8 }}>{error}</p>}
-      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '190px 1fr 210px', gap: 12, alignItems: 'start' }}>
 
-      {pages.length > 0 && (
-        <div style={{ display: 'grid', gridTemplateColumns: '190px 1fr 210px', gap: 12, alignItems: 'start' }}>
-
-          {/* Page list */}
+        {/* ── Page list sidebar ── */}
+        {pages.length > 0 ? (
           <div style={{ ...S.card, padding: 10 }}>
             <h2 style={S.h2}>Pages ({pages.length})</h2>
-            <div style={{ maxHeight: '70vh', overflowY: 'auto' }}>
+            <div style={{ maxHeight: '80vh', overflowY: 'auto' }}>
               {pages.map((p, idx) => (
                 <div key={p.id}
                   onClick={() => { setActivePage(p.id); scrollToPage(p.id); }}
@@ -715,170 +776,225 @@ export default function PdfEditor() {
               ))}
             </div>
           </div>
+        ) : <div />}
 
-          {/* Main canvas area */}
-          <div>
-            {/* Annotation toolbar */}
-            <div style={{ ...S.card, padding: 10, marginBottom: 8 }}>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-                <span style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 12 }}>Tool:</span>
-                {(['select', 'rect', 'text', 'image'] as const).map((t) => (
-                  <button key={t} style={S.btn(tool === t ? '#000' : '#fff', tool === t ? '#fff' : '#000')} onClick={() => setTool(t)}>
-                    {t === 'select' ? '↖ Select' : t === 'rect' ? '▭ Highlight' : t === 'text' ? 'T Text' : '🖼 Image'}
-                  </button>
-                ))}
-                <input type='color' value={annColor} onChange={(e) => setAnnColor(e.target.value)}
-                  style={{ width: 32, height: 28, border: '2px solid #000', cursor: 'pointer', padding: 0 }} title='Color' />
-                {tool === 'text' && (
-                  <>
-                    <input value={textInput} onChange={(e) => setTextInput(e.target.value)}
-                      placeholder='Text to add…'
-                      style={{ border: '2px solid #000', padding: '4px 8px', fontSize: 12, fontFamily: 'Poppins, sans-serif' }} />
-                    <select value={annFont} onChange={(e) => setAnnFont(e.target.value)}
-                      style={{ border: '2px solid #000', padding: '4px 6px', fontSize: 12, fontFamily: 'Poppins, sans-serif', cursor: 'pointer' }}>
-                      {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
-                    </select>
-                  </>
-                )}
-                {tool === 'image' && (
-                  <label style={{ ...S.btn('#fff', '#000'), cursor: 'pointer' }}>
-                    Choose image…
-                    <input type='file' accept='image/*' style={{ display: 'none' }}
-                      onChange={(e) => e.target.files?.[0] && addImageAnnotation(e.target.files[0])} />
-                  </label>
-                )}
-                <span style={{ marginLeft: 'auto', fontFamily: 'Poppins, sans-serif', fontSize: 11 }}>
-                  Zoom: {Math.round(viewScale * 100)}%
-                </span>
-                <input type='range' min={0.5} max={2.5} step={0.1} value={viewScale}
-                  onChange={(e) => setViewScale(parseFloat(e.target.value))} style={{ width: 80 }} />
-                <button style={S.btn('#fff', '#000')} onClick={clearPageAnnotations}>Clear page</button>
-              </div>
-              {selectedAnnId && (
-                <div style={{ marginTop: 6, display: 'flex', gap: 8, alignItems: 'center' }}>
-                  <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, color: '#0088ff' }}>Selected:</span>
-                  <button style={S.btn('#f44', '#fff')} onClick={deleteSelectedAnnotation}>✕ Delete</button>
-                  <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, color: '#555' }}>
-                    Drag to move · Drag corner handles to resize · Delete key
-                  </span>
-                </div>
+        {/* ── Main canvas area ── */}
+        <div>
+          {pages.length === 0 ? (
+            <div style={{ border: '3px solid #000', background: '#888', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 500, boxShadow: '5px 5px 0 #000' }}>
+              {loading ? (
+                <p style={{ color: '#eee', fontFamily: 'Poppins, sans-serif', fontSize: 16 }}>Loading… {loadProgress}%</p>
+              ) : (
+                <p style={{ color: '#eee', fontFamily: 'Poppins, sans-serif', fontSize: 16, textAlign: 'center', lineHeight: 1.8 }}>
+                  Open a PDF to get started
+                </p>
               )}
             </div>
-
-            {/* Scrollable per-page canvas stack */}
-            <div ref={scrollContainerRef}
-              style={{ border: '3px solid #000', background: '#888', overflow: 'auto', maxHeight: '75vh', boxShadow: '5px 5px 0 #000', userSelect: 'none' }}
-              onMouseMove={onContainerMove}
-              onMouseUp={onContainerUp}
-              onMouseLeave={onContainerUp}
-            >
-              <div style={{ padding: `${PAGE_GAP}px 12px` }}>
-                {pages.map((p) => (
-                  <div key={p.id}
-                    ref={(el) => { if (el) pageDivRefs.current.set(p.id, el); else pageDivRefs.current.delete(p.id); }}
-                    style={{ margin: `0 auto ${PAGE_GAP}px`, width: 'fit-content', position: 'relative' }}
-                  >
-                    <canvas
-                      ref={(el) => { if (el) pageCanvasRefs.current.set(p.id, el); else pageCanvasRefs.current.delete(p.id); }}
-                      style={{ display: 'block' }}
-                    />
-                    <canvas
-                      ref={(el) => { if (el) pageOverlayRefs.current.set(p.id, el); else pageOverlayRefs.current.delete(p.id); }}
-                      style={overlayStyle(p.id)}
-                      onMouseDown={(e) => onOverlayDown(e, p.id)}
-                    />
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Properties panel */}
-          <div style={S.card}>
-            <h2 style={S.h2}>Properties</h2>
-            {selAnn ? (
-              <>
-                <p style={{ ...S.label, color: '#0088ff', marginBottom: 8 }}>
-                  {selAnn.type.toUpperCase()} ANNOTATION
-                </p>
-                {(selAnn.type === 'rect' || selAnn.type === 'text') && (
-                  <>
-                    <label style={S.label}>Color</label>
-                    <input type='color' value={selAnn.color}
-                      onChange={(e) => updateSelAnn({ color: e.target.value })}
-                      style={{ width: '100%', height: 28, border: '2px solid #000', padding: 0, cursor: 'pointer', marginBottom: 8 }} />
-                  </>
-                )}
-                {selAnn.type === 'text' && (
-                  <>
-                    <label style={S.label}>Text</label>
-                    <input value={selAnn.text ?? ''}
-                      onChange={(e) => updateSelAnn({ text: e.target.value, w: e.target.value.length * 9 })}
-                      style={{ border: '1px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8 }}
-                    />
-                    <label style={S.label}>Font</label>
-                    <select value={selAnn.fontFamily ?? 'Poppins, sans-serif'}
-                      onChange={(e) => updateSelAnn({ fontFamily: e.target.value })}
-                      style={{ border: '2px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8, cursor: 'pointer' }}
-                    >
-                      {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
-                    </select>
-                  </>
-                )}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontFamily: 'Poppins, sans-serif', fontSize: 11 }}>
-                  <div>
-                    <label style={S.label}>X</label>
-                    <input type='number' value={Math.round(selAnn.x)} onChange={(e) => updateSelAnn({ x: parseInt(e.target.value) || 0 })}
-                      style={{ border: '1px solid #000', padding: '3px', width: '100%', fontFamily: 'Poppins, sans-serif', fontSize: 11 }} />
-                  </div>
-                  <div>
-                    <label style={S.label}>Y</label>
-                    <input type='number' value={Math.round(selAnn.y)} onChange={(e) => updateSelAnn({ y: parseInt(e.target.value) || 0 })}
-                      style={{ border: '1px solid #000', padding: '3px', width: '100%', fontFamily: 'Poppins, sans-serif', fontSize: 11 }} />
-                  </div>
-                  {selAnn.type !== 'text' && (
+          ) : (
+            <>
+              {/* Annotation toolbar */}
+              <div style={{ ...S.card, padding: 10, marginBottom: 8 }}>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <span style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 12 }}>Tool:</span>
+                  {(['select', 'rect', 'text', 'image'] as const).map((t) => (
+                    <button key={t} style={S.btn(tool === t ? '#000' : '#fff', tool === t ? '#fff' : '#000')} onClick={() => setTool(t)}>
+                      {t === 'select' ? '↖ Select' : t === 'rect' ? '▭ Highlight' : t === 'text' ? 'T Text' : '🖼 Image'}
+                    </button>
+                  ))}
+                  <input type='color' value={annColor} onChange={(e) => setAnnColor(e.target.value)}
+                    style={{ width: 32, height: 28, border: '2px solid #000', cursor: 'pointer', padding: 0 }} title='Color' />
+                  {tool === 'text' && (
                     <>
-                      <div>
-                        <label style={S.label}>W</label>
-                        <input type='number' value={Math.round(selAnn.w)} onChange={(e) => updateSelAnn({ w: parseInt(e.target.value) || 1 })}
-                          style={{ border: '1px solid #000', padding: '3px', width: '100%', fontFamily: 'Poppins, sans-serif', fontSize: 11 }} />
-                      </div>
-                      <div>
-                        <label style={S.label}>H</label>
-                        <input type='number' value={Math.round(selAnn.h)} onChange={(e) => updateSelAnn({ h: parseInt(e.target.value) || 1 })}
-                          style={{ border: '1px solid #000', padding: '3px', width: '100%', fontFamily: 'Poppins, sans-serif', fontSize: 11 }} />
-                      </div>
+                      <input value={textInput} onChange={(e) => setTextInput(e.target.value)}
+                        placeholder='Text to add…'
+                        style={{ border: '2px solid #000', padding: '4px 8px', fontSize: 12, fontFamily: 'Poppins, sans-serif' }} />
+                      <select value={annFont} onChange={(e) => setAnnFont(e.target.value)}
+                        style={{ border: '2px solid #000', padding: '4px 6px', fontSize: 12, fontFamily: 'Poppins, sans-serif', cursor: 'pointer' }}>
+                        {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                      </select>
                     </>
                   )}
-                </div>
-                {selAnn.type === 'image' && (
-                  <div style={{ marginTop: 8 }}>
-                    <label style={S.label}>Opacity: {Math.round((selAnn.opacity ?? 1) * 100)}%</label>
-                    <input type='range' min={0} max={100} value={Math.round((selAnn.opacity ?? 1) * 100)}
-                      onChange={(e) => updateSelAnn({ opacity: parseInt(e.target.value) / 100 })}
-                      style={{ width: '100%', marginBottom: 8 }} />
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
-                      <input type='checkbox' checked={selAnn.lockAspect ?? false}
-                        onChange={(e) => updateSelAnn({ lockAspect: e.target.checked })} />
-                      Lock aspect ratio
+                  {tool === 'image' && (
+                    <label style={{ ...S.btn('#fff', '#000'), cursor: 'pointer' }}>
+                      Choose image…
+                      <input type='file' accept='image/*' style={{ display: 'none' }}
+                        onChange={(e) => e.target.files?.[0] && addImageAnnotation(e.target.files[0])} />
                     </label>
+                  )}
+                  <span style={{ marginLeft: 'auto', fontFamily: 'Poppins, sans-serif', fontSize: 11 }}>
+                    Zoom: {Math.round(viewScale * 100)}%
+                  </span>
+                  <input type='range' min={0.25} max={2.5} step={0.05} value={viewScale}
+                    onChange={(e) => setViewScale(parseFloat(e.target.value))} style={{ width: 80 }} />
+                  <button style={S.btn('#fff', '#000')} onClick={fitToWidth} title='Fit page to available width'>⊞ Fit</button>
+                  <button style={S.btn('#fff', '#000')} onClick={clearPageAnnotations}>Clear page</button>
+                </div>
+                {selectedAnnId && (
+                  <div style={{ marginTop: 6, display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, color: '#0088ff' }}>Selected:</span>
+                    <button style={S.btn('#f44', '#fff')} onClick={deleteSelectedAnnotation}>✕ Delete</button>
+                    <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, color: '#555' }}>
+                      Drag to move · Drag corner handles to resize · Delete key
+                    </span>
                   </div>
                 )}
-              </>
-            ) : (
-              <p style={{ ...S.p, color: '#888' }}>
-                Select an annotation to edit its properties.
-                <br /><br />
-                <strong>Tips:</strong><br />
-                · Drag to move<br />
-                · Drag corner handles to resize<br />
-                · Delete key removes selected<br />
-                · Escape to deselect
-              </p>
-            )}
-          </div>
+              </div>
+
+              {/* Scrollable per-page canvas stack */}
+              <div ref={scrollContainerRef}
+                style={{ border: '3px solid #000', background: '#888', overflow: 'auto', maxHeight: '75vh', boxShadow: '5px 5px 0 #000', userSelect: 'none' }}
+                onMouseMove={onContainerMove}
+                onMouseUp={onContainerUp}
+                onMouseLeave={onContainerUp}
+              >
+                <div style={{ padding: `${PAGE_GAP}px 12px` }}>
+                  {pages.map((p) => (
+                    <div key={p.id}
+                      ref={(el) => { if (el) pageDivRefs.current.set(p.id, el); else pageDivRefs.current.delete(p.id); }}
+                      style={{ margin: `0 auto ${PAGE_GAP}px`, width: 'fit-content', position: 'relative' }}
+                    >
+                      <canvas
+                        ref={(el) => { if (el) pageCanvasRefs.current.set(p.id, el); else pageCanvasRefs.current.delete(p.id); }}
+                        style={{ display: 'block' }}
+                      />
+                      <canvas
+                        ref={(el) => { if (el) pageOverlayRefs.current.set(p.id, el); else pageOverlayRefs.current.delete(p.id); }}
+                        style={overlayStyle(p.id)}
+                        onMouseDown={(e) => onOverlayDown(e, p.id)}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
         </div>
-      )}
+
+        {/* ── Properties + file operations panel ── */}
+        <div style={S.card}>
+          <h2 style={S.h2}>📄 PDF Editor</h2>
+
+          {/* File operations — always visible */}
+          <label style={{ ...S.btn(), ...wideBtn, cursor: 'pointer' }}>
+            📂 Open PDF
+            <input type='file' accept='application/pdf' style={{ display: 'none' }}
+              onChange={(e) => e.target.files?.[0] && loadPdf(e.target.files[0])} />
+          </label>
+          {pages.length > 0 && (
+            <>
+              <button style={{ ...S.btn('#fff', '#000'), ...wideBtn }} onClick={addBlankPage}>
+                + Blank page
+              </button>
+              <label style={{ ...S.btn('#fff', '#000'), ...wideBtn, cursor: 'pointer' }}>
+                📎 Add PDF…
+                <input type='file' accept='application/pdf' style={{ display: 'none' }}
+                  onChange={(e) => e.target.files?.[0] && addPdf(e.target.files[0])} />
+              </label>
+              <button style={{ ...S.btn('#0a0', '#fff', saving), ...wideBtn }}
+                onClick={savePdf} disabled={saving}>
+                {saving ? 'Saving…' : '⬇ Save PDF'}
+              </button>
+            </>
+          )}
+          {loading && <p style={{ ...S.p, color: '#555', fontSize: 11, marginTop: 2 }}>Loading… {loadProgress}%</p>}
+          {error && <p style={{ ...S.p, color: '#c00', fontSize: 11, marginTop: 2 }}>{error}</p>}
+
+          {/* Properties section */}
+          {pages.length > 0 && (
+            <>
+              <hr style={{ margin: '10px 0', border: 'none', borderTop: '2px solid #000' }} />
+              <h2 style={{ ...S.h2, marginBottom: 6 }}>Properties</h2>
+              {selAnn ? (
+                <>
+                  <p style={{ ...S.label, color: '#0088ff', marginBottom: 8 }}>
+                    {selAnn.type.toUpperCase()} ANNOTATION
+                  </p>
+                  {(selAnn.type === 'rect' || selAnn.type === 'text') && (
+                    <>
+                      <label style={S.label}>Color</label>
+                      <input type='color' value={selAnn.color}
+                        onChange={(e) => updateSelAnn({ color: e.target.value })}
+                        style={{ width: '100%', height: 28, border: '2px solid #000', padding: 0, cursor: 'pointer', marginBottom: 8 }} />
+                    </>
+                  )}
+                  {selAnn.type === 'text' && (
+                    <>
+                      <label style={S.label}>Text</label>
+                      <input value={selAnn.text ?? ''}
+                        onChange={(e) => updateSelAnn({ text: e.target.value, w: e.target.value.length * 9 })}
+                        style={{ border: '1px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8 }}
+                      />
+                      <label style={S.label}>Font</label>
+                      <select value={selAnn.fontFamily ?? 'Poppins, sans-serif'}
+                        onChange={(e) => updateSelAnn({ fontFamily: e.target.value })}
+                        style={{ border: '2px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8, cursor: 'pointer' }}
+                      >
+                        {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                      </select>
+                    </>
+                  )}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontFamily: 'Poppins, sans-serif', fontSize: 11 }}>
+                    <div>
+                      <label style={S.label}>X</label>
+                      <input type='number' value={Math.round(selAnn.x)} onChange={(e) => updateSelAnn({ x: parseInt(e.target.value) || 0 })}
+                        style={{ border: '1px solid #000', padding: '3px', width: '100%', fontFamily: 'Poppins, sans-serif', fontSize: 11 }} />
+                    </div>
+                    <div>
+                      <label style={S.label}>Y</label>
+                      <input type='number' value={Math.round(selAnn.y)} onChange={(e) => updateSelAnn({ y: parseInt(e.target.value) || 0 })}
+                        style={{ border: '1px solid #000', padding: '3px', width: '100%', fontFamily: 'Poppins, sans-serif', fontSize: 11 }} />
+                    </div>
+                    {selAnn.type !== 'text' && (
+                      <>
+                        <div>
+                          <label style={S.label}>W</label>
+                          <input type='number' value={Math.round(selAnn.w)} onChange={(e) => updateSelAnn({ w: parseInt(e.target.value) || 1 })}
+                            style={{ border: '1px solid #000', padding: '3px', width: '100%', fontFamily: 'Poppins, sans-serif', fontSize: 11 }} />
+                        </div>
+                        <div>
+                          <label style={S.label}>H</label>
+                          <input type='number' value={Math.round(selAnn.h)} onChange={(e) => updateSelAnn({ h: parseInt(e.target.value) || 1 })}
+                            style={{ border: '1px solid #000', padding: '3px', width: '100%', fontFamily: 'Poppins, sans-serif', fontSize: 11 }} />
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  {selAnn.type === 'image' && (
+                    <div style={{ marginTop: 8 }}>
+                      <label style={S.label}>Opacity: {Math.round((selAnn.opacity ?? 1) * 100)}%</label>
+                      <input type='range' min={0} max={100} value={Math.round((selAnn.opacity ?? 1) * 100)}
+                        onChange={(e) => updateSelAnn({ opacity: parseInt(e.target.value) / 100 })}
+                        style={{ width: '100%', marginBottom: 8 }} />
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                        <input type='checkbox' checked={selAnn.lockAspect ?? false}
+                          onChange={(e) => updateSelAnn({ lockAspect: e.target.checked })} />
+                        Lock aspect ratio
+                      </label>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <p style={{ ...S.p, color: '#888', fontSize: 11 }}>
+                  Select an annotation to edit its properties.
+                  <br /><br />
+                  <strong>Tips:</strong><br />
+                  · Drag to move<br />
+                  · Drag corner handles to resize<br />
+                  · Delete key removes selected<br />
+                  · Escape to deselect
+                </p>
+              )}
+            </>
+          )}
+
+          {pages.length === 0 && !loading && (
+            <p style={{ ...S.p, color: '#888', fontSize: 11, marginTop: 6 }}>
+              Open a PDF file to start editing.
+            </p>
+          )}
+        </div>
+
+      </div>
     </div>
   );
 }
