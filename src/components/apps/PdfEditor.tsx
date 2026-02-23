@@ -212,7 +212,8 @@ export default function PdfEditor() {
   const prevPagesLenRef = useRef(0);
   useEffect(() => {
     if (prevPagesLenRef.current === 0 && pages.length > 0) {
-      setTimeout(fitToWidth, 50); // wait for DOM layout after React renders the scroll container
+      // Two nested rAFs: first waits for React commit → DOM paint, second waits for layout to settle
+      requestAnimationFrame(() => requestAnimationFrame(fitToWidth));
     }
     prevPagesLenRef.current = pages.length;
   }, [pages.length, fitToWidth]);
@@ -882,7 +883,7 @@ export default function PdfEditor() {
 
   return (
     <div style={{ maxWidth: 1400, margin: '0 auto' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '190px 1fr 210px', gap: 12, alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '190px minmax(0, 1fr) 210px', gap: 12, alignItems: 'start' }}>
 
         {/* ── Page list sidebar ── */}
         {pages.length > 0 ? (
@@ -914,7 +915,7 @@ export default function PdfEditor() {
         ) : <div />}
 
         {/* ── Main canvas area ── */}
-        <div>
+        <div style={{ minWidth: 0 }}>
           {pages.length === 0 ? (
             <div style={{ border: '3px solid #000', background: '#888', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 500, boxShadow: '5px 5px 0 #000' }}>
               {loading ? (
