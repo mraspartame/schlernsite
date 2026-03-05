@@ -165,6 +165,12 @@ export default function PdfEditor() {
   const [snapRotation, setSnapRotation] = useState(true);
   const snapToRef = useRef(snapRotation); snapToRef.current = snapRotation;
 
+  // Signature capture session
+  const [sigState, setSigState] = useState<'idle' | 'waiting' | 'received' | 'error'>('idle');
+  const [sigUrl, setSigUrl] = useState('');
+  const [sigDismissed, setSigDismissed] = useState(false);
+  const sigPeerRef = useRef<any>(null);
+
   // Interaction state
   const interactRef = useRef<{
     mode: 'create-rect' | 'move' | 'resize' | 'rotate' | null;
@@ -691,6 +697,71 @@ export default function PdfEditor() {
     img.src = src;
   };
 
+  // ── Signature from remote device ──────────────────────────────────────────
+
+  const addImageAnnotationFromDataUrl = useCallback((dataUrl: string) => {
+    const targetPage = activePageRef.current;
+    if (!targetPage) return;
+    const img = new Image();
+    img.onload = () => {
+      imageCache.current.set(dataUrl, img);
+      const scale = Math.min(1, 300 / img.naturalWidth, 300 / img.naturalHeight);
+      const w = Math.round(img.naturalWidth * scale);
+      const h = Math.round(img.naturalHeight * scale);
+      const newAnn: Annotation = {
+        id: uid(), pageId: targetPage, type: 'image',
+        x: 20, y: 20, w, h, color: '#000',
+        imageSrc: dataUrl, opacity: 1, naturalAr: w / h, lockAspect: true,
+      };
+      const next = [...annotationsRef.current, newAnn];
+      annotationsRef.current = next;
+      setAnnotations(next);
+      setSelectedAnnId(newAnn.id);
+      selectedAnnRef.current = newAnn.id;
+      setTool('select');
+    };
+    img.src = dataUrl;
+  }, []);
+
+  const startSignatureSession = async () => {
+    // Tear down any existing session
+    if (sigPeerRef.current) {
+      try { sigPeerRef.current.destroy(); } catch {}
+      sigPeerRef.current = null;
+    }
+    setSigState('waiting');
+    setSigUrl('');
+    setSigDismissed(false);
+    try {
+      const { Peer } = await import('peerjs');
+      const peer = new Peer();
+      sigPeerRef.current = peer;
+      peer.on('open', (id: string) => {
+        const code = btoa(JSON.stringify({ id }));
+        const url = `${window.location.origin}/apps/sig?c=${encodeURIComponent(code)}`;
+        setSigUrl(url);
+        navigator.clipboard.writeText(url).catch(() => {});
+      });
+      peer.on('connection', (conn: any) => {
+        conn.on('data', (data: any) => {
+          if (typeof data !== 'string') return;
+          try {
+            const msg = JSON.parse(data);
+            if (msg.type === 'signature' && msg.dataUrl) {
+              addImageAnnotationFromDataUrl(msg.dataUrl);
+              setSigState('received');
+              try { sigPeerRef.current?.destroy(); } catch {}
+              sigPeerRef.current = null;
+            }
+          } catch {}
+        });
+      });
+      peer.on('error', () => setSigState('error'));
+    } catch {
+      setSigState('error');
+    }
+  };
+
   // ── Page management ───────────────────────────────────────────────────────
 
   const movePage = (id: string, dir: -1 | 1) => {
@@ -883,6 +954,29 @@ export default function PdfEditor() {
 
   return (
     <div style={{ maxWidth: 1400, margin: '0 auto' }}>
+
+      {/* ── Signature session banner ── */}
+      {sigState === 'waiting' && sigUrl && !sigDismissed && (
+        <div style={{ border: '3px solid #000', background: '#fffde7', padding: '14px 16px', marginBottom: 12, boxShadow: '5px 5px 0 #000', display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+          <div style={{ flex: 1 }}>
+            <p style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
+              ✍ Open this link on your phone or tablet to draw your signature:
+            </p>
+            <code style={{ fontFamily: 'monospace', fontSize: 12, background: '#f5f5f5', border: '1px solid #ccc', padding: '6px 10px', display: 'block', wordBreak: 'break-all', marginBottom: 8 }}>
+              {sigUrl}
+            </code>
+            <p style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, color: '#555' }}>
+              Link copied to clipboard. Waiting for signature…
+            </p>
+          </div>
+          <button
+            onClick={() => setSigDismissed(true)}
+            style={{ border: '2px solid #000', background: '#fff', padding: '4px 8px', cursor: 'pointer', fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 14, flexShrink: 0, boxShadow: '2px 2px 0 #000' }}
+            title='Dismiss'
+          >✕</button>
+        </div>
+      )}
+
       <div style={{ display: 'grid', gridTemplateColumns: '190px minmax(0, 1fr) 210px', gap: 12, alignItems: 'start' }}>
 
         {/* ── Page list sidebar ── */}
@@ -1034,6 +1128,15 @@ export default function PdfEditor() {
                 onClick={savePdf} disabled={saving}>
                 {saving ? 'Saving…' : '⬇ Save PDF'}
               </button>
+              <button style={{ ...S.btn('#9b5de5', '#fff'), ...wideBtn }} onClick={startSignatureSession}>
+                ✍ Add Signature
+              </button>
+              {sigState === 'received' && (
+                <p style={{ ...S.p, color: '#0a0', fontWeight: 700, fontSize: 11, marginTop: 2 }}>✓ Signature placed!</p>
+              )}
+              {sigState === 'error' && (
+                <p style={{ ...S.p, color: '#c00', fontSize: 11, marginTop: 2 }}>Signature session failed.</p>
+              )}
             </>
           )}
           {loading && <p style={{ ...S.p, color: '#555', fontSize: 11, marginTop: 2 }}>Loading… {loadProgress}%</p>}
