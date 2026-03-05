@@ -1,0 +1,21 @@
+---
+import Layout from '@layouts/Default.astro';
+import QrRelay from '../../components/apps/QrRelay';
+---
+
+<Layout
+  title='QR Relay'
+  pageTitle='Schlern | QR Relay'
+  description='Scan a QR code on your phone and receive the result instantly in your desktop browser — no app, no account.'
+>
+  <main class='bg-blue p-6'>
+    <div class='mb-4'>
+      <a href='/apps/' class='poppins font-bold hover:underline'>&larr; All Apps</a>
+    </div>
+    <div class='mb-6'>
+      <h1 class='dm-serif text-4xl md:text-5xl mb-2'>QR Relay</h1>
+      <p class='poppins text-lg'>Scan a QR code on your phone, get the result on your desktop instantly.</p>
+    </div>
+    <QrRelay client:only='react' />
+  </main>
+</Layout>
