@@ -5,7 +5,11 @@ async function loadPeer(): Promise<typeof import('peerjs').Peer> {
   return Peer;
 }
 
-type Status = 'loading' | 'connecting' | 'scanning' | 'sent' | 'error' | 'unsupported';
+async function loadJsQR() {
+  return (await import('jsqr')).default;
+}
+
+type Status = 'loading' | 'connecting' | 'scanning' | 'sent' | 'error';
 
 const S = {
   btn: (bg = '#000', fg = '#fff') => ({
@@ -20,6 +24,7 @@ export default function QrScanner() {
   const [status, setStatus] = useState<Status>('loading');
   const [error, setError] = useState('');
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const peerRef = useRef<any>(null);
   const connRef = useRef<any>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -34,10 +39,6 @@ export default function QrScanner() {
     let info: { id: string };
     try { info = JSON.parse(atob(c)); } catch {
       setError('Invalid connection code.'); setStatus('error'); return;
-    }
-
-    if (!('BarcodeDetector' in window)) {
-      setStatus('unsupported'); return;
     }
 
     setStatus('connecting');
@@ -68,29 +69,36 @@ export default function QrScanner() {
   const startScanning = async () => {
     setStatus('scanning');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' } },
-      });
+      const [stream, jsQR] = await Promise.all([
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } }),
+        loadJsQR(),
+      ]);
       streamRef.current = stream;
       const video = videoRef.current!;
       video.srcObject = stream;
       await video.play();
 
-      const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+      const canvas = canvasRef.current!;
+      const ctx = canvas.getContext('2d')!;
 
-      const scan = async () => {
+      const scan = () => {
         if (sentRef.current) return;
-        try {
-          const barcodes = await detector.detect(video);
-          if (barcodes.length > 0) {
-            const text = barcodes[0].rawValue;
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0);
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'dontInvert',
+          });
+          if (code) {
             sentRef.current = true;
-            connRef.current?.send({ type: 'qr', text });
+            connRef.current?.send({ type: 'qr', text: code.data });
             setStatus('sent');
             stream.getTracks().forEach((t) => t.stop());
             return;
           }
-        } catch {}
+        }
         rafRef.current = requestAnimationFrame(scan);
       };
 
@@ -114,18 +122,6 @@ export default function QrScanner() {
       <div style={{ textAlign: 'center' }}>
         <div style={{ fontSize: 40, marginBottom: 16 }}>📷</div>
         <p style={{ fontSize: 16 }}>{status === 'loading' ? 'Loading…' : 'Connecting…'}</p>
-      </div>
-    );
-  }
-
-  if (status === 'unsupported') {
-    return centerScreen(
-      <div style={{ textAlign: 'center', maxWidth: 320 }}>
-        <div style={{ fontSize: 40, marginBottom: 16 }}>⚠️</div>
-        <p style={{ fontFamily: 'DM Serif Text, serif', fontSize: 22, marginBottom: 10 }}>Browser not supported</p>
-        <p style={{ fontSize: 14, color: '#555', lineHeight: 1.6 }}>
-          QR scanning requires Chrome or Safari on iOS 17+. Please open this link in a supported browser.
-        </p>
       </div>
     );
   }
@@ -157,6 +153,7 @@ export default function QrScanner() {
           playsInline
           style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
         />
+        <canvas ref={canvasRef} style={{ display: 'none' }} />
         {/* Targeting overlay */}
         <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
           <div style={{ width: 220, height: 220, position: 'relative' }}>
