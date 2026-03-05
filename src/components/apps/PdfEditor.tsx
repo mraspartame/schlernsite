@@ -268,9 +268,6 @@ export default function PdfEditor() {
           ctx.globalAlpha = ann.opacity ?? 1;
           ctx.drawImage(img, ann.x, ann.y, ann.w, ann.h);
           ctx.globalAlpha = 1;
-          ctx.strokeStyle = '#000';
-          ctx.lineWidth = 1;
-          ctx.strokeRect(ann.x, ann.y, ann.w, ann.h);
         }
       }
       ctx.restore();
@@ -1124,12 +1121,12 @@ export default function PdfEditor() {
                 <input type='file' accept='application/pdf' style={{ display: 'none' }}
                   onChange={(e) => e.target.files?.[0] && addPdf(e.target.files[0])} />
               </label>
+              <button style={{ ...S.btn('#9b5de5', '#fff'), ...wideBtn }} onClick={startSignatureSession}>
+                ✍ Add Signature
+              </button>
               <button style={{ ...S.btn('#0a0', '#fff', saving), ...wideBtn }}
                 onClick={savePdf} disabled={saving}>
                 {saving ? 'Saving…' : '⬇ Save PDF'}
-              </button>
-              <button style={{ ...S.btn('#9b5de5', '#fff'), ...wideBtn }} onClick={startSignatureSession}>
-                ✍ Add Signature
               </button>
               {sigState === 'received' && (
                 <p style={{ ...S.p, color: '#0a0', fontWeight: 700, fontSize: 11, marginTop: 2 }}>✓ Signature placed!</p>

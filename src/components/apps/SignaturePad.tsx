@@ -64,9 +64,11 @@ export default function SignaturePad() {
     if (!canvas) return;
 
     const initCanvas = () => {
-      canvas.width = canvas.offsetWidth;
-      canvas.height = canvas.offsetHeight;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = canvas.offsetWidth * dpr;
+      canvas.height = canvas.offsetHeight * dpr;
       const ctx = canvas.getContext('2d')!;
+      ctx.scale(dpr, dpr);
       ctx.strokeStyle = '#000';
       ctx.lineWidth = 3;
       ctx.lineCap = 'round';
