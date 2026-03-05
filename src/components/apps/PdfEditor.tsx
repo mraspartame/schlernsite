@@ -744,10 +744,10 @@ export default function PdfEditor() {
       });
       peer.on('connection', (conn: any) => {
         conn.on('data', (data: any) => {
-          if (typeof data !== 'string') return;
           try {
-            const msg = JSON.parse(data);
-            if (msg.type === 'signature' && msg.dataUrl) {
+            // PeerJS may deliver data as a string or already-parsed object depending on serialization
+            const msg = typeof data === 'string' ? JSON.parse(data) : data;
+            if (msg?.type === 'signature' && msg.dataUrl) {
               addImageAnnotationFromDataUrl(msg.dataUrl);
               setSigState('received');
               try { sigPeerRef.current?.destroy(); } catch {}

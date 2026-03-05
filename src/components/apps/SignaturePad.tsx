@@ -57,18 +57,26 @@ export default function SignaturePad() {
     return () => { try { peerRef.current?.destroy(); } catch {} };
   }, []);
 
-  // Init canvas dimensions once ready
+  // Init canvas dimensions once ready + re-init on resize/rotate (clears drawing)
   useEffect(() => {
     if (status !== 'ready') return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    canvas.width = canvas.offsetWidth;
-    canvas.height = canvas.offsetHeight;
-    const ctx = canvas.getContext('2d')!;
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 3;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
+
+    const initCanvas = () => {
+      canvas.width = canvas.offsetWidth;
+      canvas.height = canvas.offsetHeight;
+      const ctx = canvas.getContext('2d')!;
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      hasStrokesRef.current = false;
+    };
+
+    initCanvas();
+    window.addEventListener('resize', initCanvas);
+    return () => window.removeEventListener('resize', initCanvas);
   }, [status]);
 
   // Touch and mouse drawing
@@ -138,7 +146,8 @@ export default function SignaturePad() {
     if (!canvas || !conn) return;
     // Crop to bounding box of drawn content so the transparent PNG is tight
     const dataUrl = cropSignature(canvas);
-    conn.send(JSON.stringify({ type: 'signature', dataUrl }));
+    // Send as object — PeerJS binary serialization delivers it as a parsed object on the receiver
+    conn.send({ type: 'signature', dataUrl });
     setStatus('sent');
     try { peerRef.current?.destroy(); } catch {}
   };
