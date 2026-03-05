@@ -149,7 +149,10 @@ export default function SignaturePad() {
     // Send as object — PeerJS binary serialization delivers it as a parsed object on the receiver
     conn.send({ type: 'signature', dataUrl });
     setStatus('sent');
-    try { peerRef.current?.destroy(); } catch {}
+    // Do NOT destroy the peer here — conn.send() only queues the data;
+    // destroying immediately drops it before WebRTC can flush the buffer.
+    // The PDF editor destroys its peer after receiving, which closes this
+    // connection naturally. The useEffect cleanup handles the rest on tab close.
   };
 
   // Crops canvas to the tightest bounding box around actual ink pixels
