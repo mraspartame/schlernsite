@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const W = 900, H = 600;
+const DEFAULT_W = 1920, DEFAULT_H = 1080;
 const HANDLE_R = 8;   // hit radius for resize handles (px)
 const HANDLE_SZ = 8;  // visual size of handles (px)
 
@@ -332,6 +332,19 @@ export default function PaintEditor() {
   const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [snapRotation, setSnapRotation] = useState(true);
 
+  // Document dimensions (dynamic - changes on crop)
+  const [docW, setDocW] = useState(DEFAULT_W);
+  const [docH, setDocH] = useState(DEFAULT_H);
+  const docWRef = useRef(DEFAULT_W); docWRef.current = docW;
+  const docHRef = useRef(DEFAULT_H); docHRef.current = docH;
+
+  // Zoom
+  const [zoom, setZoom] = useState(0.5);
+  const zoomRef = useRef(0.5); zoomRef.current = zoom;
+
+  // Paste dialog
+  const [pasteDialog, setPasteDialog] = useState<string | null>(null);
+
   // ── Refs (always-fresh values for event callbacks) ─────────────────────────
   const layersRef = useRef(layers);           layersRef.current = layers;
   const objectsRef = useRef(objects);         objectsRef.current = objects;
@@ -348,6 +361,7 @@ export default function PaintEditor() {
   // ── Canvas refs ────────────────────────────────────────────────────────────
   const displayRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
   /** Per-layer raster pixel canvas (pencil / eraser / fill) */
   const pixelCanvases = useRef<Map<string, HTMLCanvasElement>>(new Map());
   /** Per-layer temp canvas for compositing pixels + objects */
@@ -376,18 +390,23 @@ export default function PaintEditor() {
   cropRectRef.current = cropRect;
 
   // ── History ────────────────────────────────────────────────────────────────
-  const history = useRef<{ pixels: { id: string; data: ImageData }[]; objects: PaintObj[] }[]>([]);
+  const history = useRef<{ pixels: { id: string; data: ImageData }[]; objects: PaintObj[]; docW: number; docH: number }[]>([]);
   const histIdx = useRef(-1);
 
   // ── Rendering ──────────────────────────────────────────────────────────────
 
   function getTempCanvas(layerId: string): HTMLCanvasElement {
-    if (!tempCanvases.current.has(layerId)) {
-      const c = document.createElement('canvas');
-      c.width = W; c.height = H;
+    const dw = docWRef.current, dh = docHRef.current;
+    let c = tempCanvases.current.get(layerId);
+    if (!c) {
+      c = document.createElement('canvas');
+      c.width = dw; c.height = dh;
       tempCanvases.current.set(layerId, c);
     }
-    return tempCanvases.current.get(layerId)!;
+    if (c.width !== dw || c.height !== dh) {
+      c.width = dw; c.height = dh;
+    }
+    return c;
   }
 
   const renderAll = useCallback((
@@ -397,13 +416,14 @@ export default function PaintEditor() {
     previewShape?: { type: ObjType; x: number; y: number; w: number; h: number } | null,
   ) => {
     if (!displayRef.current || !overlayRef.current) return;
+    const dw = docWRef.current, dh = docHRef.current;
     const display = displayRef.current.getContext('2d')!;
     const overlay = overlayRef.current.getContext('2d')!;
 
     // Composite layers onto display
-    display.clearRect(0, 0, W, H);
+    display.clearRect(0, 0, dw, dh);
     display.fillStyle = '#fff';
-    display.fillRect(0, 0, W, H);
+    display.fillRect(0, 0, dw, dh);
 
     for (const layer of currentLayers) {
       if (!layer.visible) continue;
@@ -412,7 +432,7 @@ export default function PaintEditor() {
 
       const tc = getTempCanvas(layer.id);
       const tcCtx = tc.getContext('2d')!;
-      tcCtx.clearRect(0, 0, W, H);
+      tcCtx.clearRect(0, 0, dw, dh);
       tcCtx.drawImage(pc, 0, 0);
       currentObjects
         .filter((o) => o.layerId === layer.id)
@@ -426,7 +446,7 @@ export default function PaintEditor() {
     }
 
     // Overlay: selection handles + shape/text preview
-    overlay.clearRect(0, 0, W, H);
+    overlay.clearRect(0, 0, dw, dh);
 
     // Draw selected object highlight (rotated with the object)
     if (currentSelectedId) {
@@ -458,7 +478,7 @@ export default function PaintEditor() {
           overlay.strokeRect(handle.x - HANDLE_SZ / 2, handle.y - HANDLE_SZ / 2, HANDLE_SZ, HANDLE_SZ);
         }
 
-        // Rotation handle — stem line then circle, 30px above top-center in local space
+        // Rotation handle -- stem line then circle, 30px above top-center in local space
         const rhX = x + w / 2, rhY = y - 2;
         overlay.beginPath();
         overlay.moveTo(rhX, rhY);
@@ -525,10 +545,10 @@ export default function PaintEditor() {
       const { x, y, w, h } = cropRectRef.current;
       overlay.save();
       overlay.fillStyle = 'rgba(0,0,0,0.45)';
-      overlay.fillRect(0, 0, W, y);
-      overlay.fillRect(0, y + h, W, H - y - h);
+      overlay.fillRect(0, 0, dw, y);
+      overlay.fillRect(0, y + h, dw, dh - y - h);
       overlay.fillRect(0, y, x, h);
-      overlay.fillRect(x + w, y, W - x - w, h);
+      overlay.fillRect(x + w, y, dw - x - w, h);
       overlay.strokeStyle = '#fff';
       overlay.lineWidth = 1.5;
       overlay.setLineDash([5, 4]);
@@ -541,17 +561,33 @@ export default function PaintEditor() {
   // ── History ────────────────────────────────────────────────────────────────
 
   function saveHistory() {
+    const dw = docWRef.current, dh = docHRef.current;
     const pixels = Array.from(pixelCanvases.current.entries()).map(([id, c]) => ({
       id,
-      data: c.getContext('2d')!.getImageData(0, 0, W, H),
+      data: c.getContext('2d')!.getImageData(0, 0, dw, dh),
     }));
-    const snap = { pixels, objects: [...objectsRef.current] };
+    const snap = { pixels, objects: [...objectsRef.current], docW: dw, docH: dh };
     history.current = history.current.slice(0, histIdx.current + 1);
     history.current.push(snap);
     histIdx.current++;
   }
 
   function applyHistoryEntry(entry: typeof history.current[0]) {
+    // Restore doc dimensions if changed
+    if (entry.docW !== docWRef.current || entry.docH !== docHRef.current) {
+      docWRef.current = entry.docW;
+      docHRef.current = entry.docH;
+      setDocW(entry.docW);
+      setDocH(entry.docH);
+      pixelCanvases.current.forEach((pc) => {
+        pc.width = entry.docW;
+        pc.height = entry.docH;
+      });
+      tempCanvases.current.forEach((tc) => {
+        tc.width = entry.docW;
+        tc.height = entry.docH;
+      });
+    }
     entry.pixels.forEach(({ id, data }) => {
       const c = pixelCanvases.current.get(id);
       if (c) c.getContext('2d')!.putImageData(data, 0, 0);
@@ -575,12 +611,12 @@ export default function PaintEditor() {
     applyHistoryEntry(history.current[histIdx.current]);
   }, []);
 
-  // ── Pointer → canvas coords ────────────────────────────────────────────────
+  // ── Pointer -> canvas coords ────────────────────────────────────────────────
 
   function getPos(e: React.MouseEvent | MouseEvent): { x: number; y: number } {
     const rect = overlayRef.current!.getBoundingClientRect();
-    const scaleX = W / rect.width;
-    const scaleY = H / rect.height;
+    const scaleX = docWRef.current / rect.width;
+    const scaleY = docHRef.current / rect.height;
     return {
       x: ((e as MouseEvent).clientX - rect.left) * scaleX,
       y: ((e as MouseEvent).clientY - rect.top) * scaleY,
@@ -589,15 +625,12 @@ export default function PaintEditor() {
 
   /** Get the composite of all layers up to (and including) targetLayerId, for flood fill reading */
   function getCompositeCtx(targetLayerId: string): CanvasRenderingContext2D {
+    const dw = docWRef.current, dh = docHRef.current;
     const tc = getTempCanvas('__fill_composite__');
-    if (!tempCanvases.current.has('__fill_composite__')) {
-      tc.width = W; tc.height = H;
-      tempCanvases.current.set('__fill_composite__', tc);
-    }
     const ctx = tc.getContext('2d')!;
-    ctx.clearRect(0, 0, W, H);
+    ctx.clearRect(0, 0, dw, dh);
     ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillRect(0, 0, dw, dh);
     for (const layer of layersRef.current) {
       if (!layer.visible) continue;
       const pc = pixelCanvases.current.get(layer.id);
@@ -732,10 +765,11 @@ export default function PaintEditor() {
       return;
     }
 
-    // Shape creation begins — save snapshot for live preview
+    // Shape creation begins -- save snapshot for live preview
     if (t === 'line' || t === 'rect' || t === 'ellipse') {
       saveHistory();
-      pixelSnapshot.current = pc.getContext('2d')!.getImageData(0, 0, W, H);
+      const dw = docWRef.current, dh = docHRef.current;
+      pixelSnapshot.current = pc.getContext('2d')!.getImageData(0, 0, dw, dh);
     }
   }, [renderAll]);
 
@@ -788,7 +822,7 @@ export default function PaintEditor() {
       const dy = pos.y - (lastPos.current?.y ?? pos.y);
       lastPos.current = pos;
 
-      // Rotation drag — computed from angle to object center
+      // Rotation drag -- computed from angle to object center
       if (dragMode.current === 'rotate' && dragOrigObj.current) {
         const orig = dragOrigObj.current;
         const { x, y, w, h } = getDisplayBounds(orig);
@@ -796,7 +830,7 @@ export default function PaintEditor() {
         const angle = Math.atan2(pos.y - cy, pos.x - cx);
         const delta = (angle - dragStartAngle.current) * 180 / Math.PI;
         let newRot = ((dragStartRotation.current + delta) % 360 + 360) % 360;
-        // Snap within 8° of any 90° multiple
+        // Snap within 8deg of any 90deg multiple
         if (snapToRef.current) {
           const nearest = Math.round(newRot / 90) * 90 % 360;
           if (Math.abs(newRot - nearest) < 8) newRot = nearest;
@@ -942,7 +976,7 @@ export default function PaintEditor() {
 
   function makePixelCanvas() {
     const c = document.createElement('canvas');
-    c.width = W; c.height = H;
+    c.width = docWRef.current; c.height = docHRef.current;
     return c;
   }
 
@@ -1009,20 +1043,19 @@ export default function PaintEditor() {
 
   // ── Import image as object ─────────────────────────────────────────────────
 
-  const importImage = useCallback((file: File) => {
-    if (!activeLayerRef.current) return;
-    const src = URL.createObjectURL(file);
+  const addImageToLayer = useCallback((src: string, layerId: string) => {
     const img = new Image();
     img.onload = () => {
       imageCache.current.set(src, img);
-      const scale = Math.min(1, W / img.naturalWidth, H / img.naturalHeight);
+      const dw = docWRef.current, dh = docHRef.current;
+      const scale = Math.min(1, dw / img.naturalWidth, dh / img.naturalHeight);
       const w = Math.round(img.naturalWidth * scale);
       const h = Math.round(img.naturalHeight * scale);
-      const x = Math.round((W - w) / 2);
-      const y = Math.round((H - h) / 2);
+      const x = Math.round((dw - w) / 2);
+      const y = Math.round((dh - h) / 2);
       saveHistory();
       const newObj: PaintObj = {
-        id: uid(), layerId: activeLayerRef.current!, type: 'image',
+        id: uid(), layerId, type: 'image',
         x, y, w, h, opacity: 1, src,
         naturalAr: w / h,
       };
@@ -1038,21 +1071,65 @@ export default function PaintEditor() {
     img.src = src;
   }, [renderAll]);
 
+  const importImage = useCallback((file: File) => {
+    if (!activeLayerRef.current) return;
+    const src = URL.createObjectURL(file);
+    addImageToLayer(src, activeLayerRef.current);
+  }, [addImageToLayer]);
+
+  // ── Paste handling ─────────────────────────────────────────────────────────
+
+  const pasteToCurrentLayer = useCallback((dataUrl: string) => {
+    if (!activeLayerRef.current) return;
+    addImageToLayer(dataUrl, activeLayerRef.current);
+    setPasteDialog(null);
+  }, [addImageToLayer]);
+
+  const pasteAsNewLayer = useCallback((dataUrl: string) => {
+    const id = uid();
+    pixelCanvases.current.set(id, makePixelCanvas());
+    const layer: Layer = { id, name: `Layer ${layersRef.current.length + 1}`, visible: true, opacity: 1, blendMode: 'source-over' };
+    const next = [...layersRef.current, layer];
+    layersRef.current = next;
+    setLayers(next);
+    setActiveLayerId(id);
+    activeLayerRef.current = id;
+    addImageToLayer(dataUrl, id);
+    setPasteDialog(null);
+  }, [addImageToLayer]);
+
   // ── Crop ────────────────────────────────────────────────────────────────────
 
   const applyCrop = useCallback((rect: { x: number; y: number; w: number; h: number }) => {
     saveHistory();
+    const dw = docWRef.current, dh = docHRef.current;
     const ix = Math.max(0, Math.round(rect.x));
     const iy = Math.max(0, Math.round(rect.y));
-    const iw = Math.min(W - ix, Math.round(rect.w));
-    const ih = Math.min(H - iy, Math.round(rect.h));
-    // Shift pixel canvas content so crop top-left becomes (0,0)
+    const iw = Math.min(dw - ix, Math.round(rect.w));
+    const ih = Math.min(dh - iy, Math.round(rect.h));
+    if (iw < 1 || ih < 1) return;
+
+    // Extract cropped region from each pixel canvas and resize
     pixelCanvases.current.forEach((pc) => {
       const ctx = pc.getContext('2d')!;
       const data = ctx.getImageData(ix, iy, iw, ih);
-      ctx.clearRect(0, 0, W, H);
+      pc.width = iw;
+      pc.height = ih;
       ctx.putImageData(data, 0, 0);
     });
+
+    // Resize temp canvases
+    tempCanvases.current.forEach((tc) => {
+      tc.width = iw;
+      tc.height = ih;
+    });
+
+    // Update document dimensions
+    docWRef.current = iw;
+    docHRef.current = ih;
+    setDocW(iw);
+    setDocH(ih);
+
     // Shift all objects by the crop offset
     const objs = objectsRef.current.map((o) => ({ ...o, x: o.x - ix, y: o.y - iy }));
     objectsRef.current = objs;
@@ -1075,6 +1152,18 @@ export default function PaintEditor() {
     applyCrop(bounds);
   }, [applyCrop]);
 
+  // ── Zoom ──────────────────────────────────────────────────────────────────
+
+  const fitToContainer = useCallback(() => {
+    if (canvasContainerRef.current) {
+      const containerW = canvasContainerRef.current.clientWidth - 6;
+      const containerH = canvasContainerRef.current.clientHeight || 600;
+      const z = Math.min(1, containerW / docWRef.current, containerH / docHRef.current);
+      setZoom(z);
+      zoomRef.current = z;
+    }
+  }, []);
+
   // ── Export / new ───────────────────────────────────────────────────────────
 
   const exportPng = useCallback(() => {
@@ -1090,11 +1179,17 @@ export default function PaintEditor() {
     tempCanvases.current.clear();
     history.current = [];
     histIdx.current = -1;
+    docWRef.current = DEFAULT_W;
+    docHRef.current = DEFAULT_H;
+    setDocW(DEFAULT_W);
+    setDocH(DEFAULT_H);
     const id = uid();
-    const pc = makePixelCanvas();
-    pc.getContext('2d')!.fillStyle = '#ffffff';
-    pc.getContext('2d')!.fillRect(0, 0, W, H);
-    pixelCanvases.current.set(id, pc);
+    const c = document.createElement('canvas');
+    c.width = DEFAULT_W; c.height = DEFAULT_H;
+    const ctx = c.getContext('2d')!;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, DEFAULT_W, DEFAULT_H);
+    pixelCanvases.current.set(id, c);
     const layer: Layer = { id, name: 'Layer 1', visible: true, opacity: 1, blendMode: 'source-over' };
     objectsRef.current = [];
     setObjects([]);
@@ -1108,32 +1203,88 @@ export default function PaintEditor() {
 
   useEffect(() => {
     const id = uid();
-    const pc = makePixelCanvas();
+    const pc = document.createElement('canvas');
+    pc.width = DEFAULT_W; pc.height = DEFAULT_H;
     const pCtx = pc.getContext('2d')!;
     pCtx.fillStyle = '#ffffff';
-    pCtx.fillRect(0, 0, W, H);
+    pCtx.fillRect(0, 0, DEFAULT_W, DEFAULT_H);
     pixelCanvases.current.set(id, pc);
     const layer: Layer = { id, name: 'Layer 1', visible: true, opacity: 1, blendMode: 'source-over' };
     setLayers([layer]);
     setActiveLayerId(id);
     saveHistory();
+    // Fit zoom to container after first render
+    requestAnimationFrame(() => {
+      if (canvasContainerRef.current) {
+        const containerW = canvasContainerRef.current.clientWidth - 6;
+        const z = Math.min(1, containerW / DEFAULT_W);
+        setZoom(z);
+        zoomRef.current = z;
+      }
+    });
   }, []);
 
   useEffect(() => {
     renderAll(layers, objects, selectedId);
-  }, [layers, objects, selectedId, renderAll]);
+  }, [layers, objects, selectedId, docW, docH, renderAll]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
       if (e.key === 'Delete' || e.key === 'Backspace') deleteSelected();
-      if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo(); }
-      if (e.ctrlKey && e.key === 'y') { e.preventDefault(); redo(); }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'y') { e.preventDefault(); redo(); }
       if (e.key === 'Escape') { setSelectedId(null); selectedIdRef.current = null; renderAll(layersRef.current, objectsRef.current, null); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [deleteSelected, undo, redo, renderAll]);
+
+  // Paste event listener
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of Array.from(items)) {
+        if (item.type.startsWith('image/')) {
+          e.preventDefault();
+          const blob = item.getAsFile();
+          if (!blob) continue;
+          const url = URL.createObjectURL(blob);
+          setPasteDialog(url);
+          return;
+        }
+      }
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, []);
+
+  // Ctrl+wheel zoom
+  useEffect(() => {
+    const container = canvasContainerRef.current;
+    if (!container) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const rect = container.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left + container.scrollLeft;
+      const mouseY = e.clientY - rect.top + container.scrollTop;
+      const oldZ = zoomRef.current;
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      const newZ = Math.max(0.1, Math.min(4, oldZ * factor));
+      setZoom(newZ);
+      zoomRef.current = newZ;
+      // Adjust scroll to zoom toward cursor
+      requestAnimationFrame(() => {
+        const scale = newZ / oldZ;
+        container.scrollLeft = mouseX * scale - (e.clientX - rect.left);
+        container.scrollTop = mouseY * scale - (e.clientY - rect.top);
+      });
+    };
+    container.addEventListener('wheel', onWheel, { passive: false });
+    return () => container.removeEventListener('wheel', onWheel);
+  }, []);
 
   // ── Selected object for sidebar display ────────────────────────────────────
 
@@ -1148,15 +1299,15 @@ export default function PaintEditor() {
   const SWATCHES = ['#000000', '#ffffff', '#2563eb', '#16a34a', '#dc2626', '#9333ea'];
 
   const TOOLS: { id: Tool; label: string; icon: string }[] = [
-    { id: 'select', label: 'Select', icon: '↖' },
-    { id: 'pencil', label: 'Pencil', icon: '✏️' },
-    { id: 'eraser', label: 'Eraser', icon: '🧹' },
-    { id: 'fill', label: 'Fill', icon: '🪣' },
-    { id: 'line', label: 'Line', icon: '╱' },
-    { id: 'rect', label: 'Rect', icon: '▭' },
-    { id: 'ellipse', label: 'Ellipse', icon: '◯' },
+    { id: 'select', label: 'Select', icon: '\u2196' },
+    { id: 'pencil', label: 'Pencil', icon: '\u270F\uFE0F' },
+    { id: 'eraser', label: 'Eraser', icon: '\uD83E\uDDF9' },
+    { id: 'fill', label: 'Fill', icon: '\uD83E\uDEA3' },
+    { id: 'line', label: 'Line', icon: '\u2571' },
+    { id: 'rect', label: 'Rect', icon: '\u25AD' },
+    { id: 'ellipse', label: 'Ellipse', icon: '\u25EF' },
     { id: 'text', label: 'Text', icon: 'T' },
-    { id: 'crop', label: 'Crop', icon: '✂' },
+    { id: 'crop', label: 'Crop', icon: '\u2702' },
   ];
 
   const BLENDS: BlendMode[] = ['source-over', 'multiply', 'screen', 'overlay'];
@@ -1165,43 +1316,75 @@ export default function PaintEditor() {
 
   return (
     <div style={{ maxWidth: 1340, margin: '0 auto' }}>
+      {/* Paste dialog */}
+      {pasteDialog && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+          <div style={{ background: '#fff', border: '3px solid #000', padding: 24, boxShadow: '5px 5px 0 #000', fontFamily: 'Poppins, sans-serif', textAlign: 'center', maxWidth: 360 }}>
+            <p style={{ fontWeight: 700, fontSize: 16, marginBottom: 16, marginTop: 0 }}>Paste Image</p>
+            <p style={{ fontSize: 13, marginBottom: 20, color: '#555' }}>Where would you like to paste this image?</p>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
+              <button style={{ ...S.smallBtn('#000', '#fff'), padding: '8px 16px', fontSize: 13 }}
+                onClick={() => pasteToCurrentLayer(pasteDialog)}>
+                Current Layer
+              </button>
+              <button style={{ ...S.smallBtn('#2563eb', '#fff'), padding: '8px 16px', fontSize: 13 }}
+                onClick={() => pasteAsNewLayer(pasteDialog)}>
+                New Layer
+              </button>
+              <button style={{ ...S.smallBtn(), padding: '8px 16px', fontSize: 13 }}
+                onClick={() => { URL.revokeObjectURL(pasteDialog); setPasteDialog(null); }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top bar */}
       <div style={{ border: '3px solid #000', background: '#fff', padding: '8px 12px', marginBottom: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', boxShadow: '4px 4px 0 #000' }}>
-        <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 20 }}>🖌️ Paint</strong>
+        <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 20 }}>{'\uD83C\uDFA8'} Paint</strong>
         <button style={S.smallBtn()} onClick={newCanvas}>New</button>
         <label style={{ ...S.smallBtn(), cursor: 'pointer' }}>
           Add image
           <input type='file' accept='image/*' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && importImage(e.target.files[0])} />
         </label>
-        <button style={S.smallBtn()} onClick={exportPng}>⬇ PNG</button>
+        <button style={S.smallBtn()} onClick={exportPng}>{'\u2B07'} PNG</button>
         <span style={{ width: 1, background: '#000', height: 20, display: 'inline-block', margin: '0 4px' }} />
-        <button style={S.smallBtn()} onClick={undo} title='Ctrl+Z'>↩ Undo</button>
-        <button style={S.smallBtn()} onClick={redo} title='Ctrl+Y'>↪ Redo</button>
+        <button style={S.smallBtn()} onClick={undo} title='Ctrl+Z'>{'\u21A9'} Undo</button>
+        <button style={S.smallBtn()} onClick={redo} title='Ctrl+Y'>{'\u21AA'} Redo</button>
         {selectedId && (
           <button style={S.smallBtn('#f44', '#fff')} onClick={deleteSelected}>
-            ✕ Delete selected
+            {'\u2715'} Delete selected
           </button>
         )}
         {selectedId && (
           <button style={S.smallBtn()} onClick={cropToSelection} title='Crop canvas to bounding box of selected object'>
-            ✂ Crop to Selection
+            {'\u2702'} Crop to Selection
           </button>
         )}
         {cropRect && (
           <>
-            <button style={S.smallBtn('#0a0', '#fff')} onClick={() => applyCrop(cropRect)}>✓ Apply Crop</button>
+            <button style={S.smallBtn('#0a0', '#fff')} onClick={() => applyCrop(cropRect)}>{'\u2713'} Apply Crop</button>
             <button style={S.smallBtn()} onClick={() => {
               cropRectRef.current = null;
               setCropRect(null);
               renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
-            }}>✕ Cancel</button>
+            }}>{'\u2715'} Cancel</button>
           </>
         )}
+        <span style={{ width: 1, background: '#000', height: 20, display: 'inline-block', margin: '0 4px' }} />
+        {/* Zoom controls */}
+        <button style={S.smallBtn()} onClick={() => setZoom((z) => { const nz = Math.max(0.1, z - 0.1); zoomRef.current = nz; return nz; })} title='Zoom out'>{'\u2212'}</button>
+        <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, minWidth: 40, textAlign: 'center' }}>{Math.round(zoom * 100)}%</span>
+        <button style={S.smallBtn()} onClick={() => setZoom((z) => { const nz = Math.min(4, z + 0.1); zoomRef.current = nz; return nz; })} title='Zoom in'>+</button>
+        <button style={S.smallBtn()} onClick={fitToContainer} title='Fit to view'>Fit</button>
+        <button style={S.smallBtn()} onClick={() => { setZoom(1); zoomRef.current = 1; }} title='100%'>1:1</button>
+        <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 10, color: '#666' }}>{docW}{'\u00D7'}{docH}</span>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '158px 1fr 192px', gap: 8, alignItems: 'start' }}>
 
-        {/* ── Left panel: tools + drawing options ─────────────────────────── */}
+        {/* -- Left panel: tools + drawing options -- */}
         <div style={{ ...S.panel, display: 'flex', flexDirection: 'column', gap: 2 }}>
           <p style={{ ...S.label, marginBottom: 6 }}>TOOLS</p>
           {TOOLS.map((t) => (
@@ -1216,7 +1399,7 @@ export default function PaintEditor() {
 
           <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
 
-          {/* Contextual options — selected object vs drawing */}
+          {/* Contextual options -- selected object vs drawing */}
           {selObj ? (
             <>
               <p style={{ ...S.label, color: '#0088ff' }}>SELECTED: {selObj.type.toUpperCase()}</p>
@@ -1280,18 +1463,18 @@ export default function PaintEditor() {
                 style={{ width: '100%' }} />
 
               <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
-              <label style={S.label}>Rotation: {Math.round(selObj.rotation ?? 0)}°</label>
+              <label style={S.label}>Rotation: {Math.round(selObj.rotation ?? 0)}{'\u00B0'}</label>
               <input type='range' min={0} max={359} value={Math.round(selObj.rotation ?? 0)}
                 onChange={(e) => updateSelectedObj({ rotation: parseInt(e.target.value) })}
                 style={{ width: '100%' }} />
               <div style={{ display: 'flex', gap: 3, marginBottom: 4, flexWrap: 'wrap' }}>
                 {[0, 90, 180, 270].map((a) => (
-                  <button key={a} style={S.smallBtn()} onClick={() => updateSelectedObj({ rotation: a })}>{a}°</button>
+                  <button key={a} style={S.smallBtn()} onClick={() => updateSelectedObj({ rotation: a })}>{a}{'\u00B0'}</button>
                 ))}
               </div>
               <label style={{ display: 'flex', alignItems: 'center', gap: 4, ...S.label, cursor: 'pointer', marginBottom: 0 }}>
                 <input type='checkbox' checked={snapRotation} onChange={(e) => setSnapRotation(e.target.checked)} />
-                Snap to 90°
+                Snap to 90{'\u00B0'}
               </label>
             </>
           ) : (
@@ -1321,7 +1504,7 @@ export default function PaintEditor() {
                 <>
                   <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
                   <label style={S.label}>Text to place</label>
-                  <input style={S.input} value={textInput} onChange={(e) => setTextInput(e.target.value)} placeholder='Enter text…' />
+                  <input style={S.input} value={textInput} onChange={(e) => setTextInput(e.target.value)} placeholder='Enter text...' />
                   <label style={S.label}>Font</label>
                   <select value={fontFamily} onChange={(e) => setFontFamily(e.target.value)}
                     style={{ width: '100%', border: '1px solid #000', padding: '3px 4px', fontFamily: 'Poppins, sans-serif', fontSize: 11, marginBottom: 4 }}>
@@ -1343,31 +1526,33 @@ export default function PaintEditor() {
           )}
         </div>
 
-        {/* ── Center: canvas ───────────────────────────────────────────────── */}
-        <div style={{ position: 'relative', lineHeight: 0, border: '3px solid #000', boxShadow: '5px 5px 0 #000' }}>
-          {/* Display (composite) */}
-          <canvas ref={displayRef} width={W} height={H}
-            style={{ display: 'block', width: '100%', pointerEvents: 'none' }} />
-          {/* Overlay (events, selection, preview) */}
-          <canvas ref={overlayRef} width={W} height={H}
-            style={{ display: 'block', width: '100%', position: 'absolute', top: 0, left: 0, cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : 'crosshair' }}
-            onMouseDown={onMouseDown}
-            onMouseMove={onMouseMove}
-            onMouseUp={onMouseUp}
-            onMouseLeave={() => {
-              cursorPos.current = null;
-              if (drawing.current) {
-                drawing.current = false;
-                dragMode.current = null;
-                renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
-              } else {
-                renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
-              }
-            }}
-          />
+        {/* -- Center: canvas -- */}
+        <div ref={canvasContainerRef} style={{ border: '3px solid #000', boxShadow: '5px 5px 0 #000', overflow: 'auto', maxHeight: '78vh', background: '#888' }}>
+          <div style={{ width: docW * zoom, height: docH * zoom, position: 'relative', lineHeight: 0 }}>
+            {/* Display (composite) */}
+            <canvas ref={displayRef} width={docW} height={docH}
+              style={{ display: 'block', width: '100%', height: '100%', pointerEvents: 'none' }} />
+            {/* Overlay (events, selection, preview) */}
+            <canvas ref={overlayRef} width={docW} height={docH}
+              style={{ display: 'block', width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : 'crosshair' }}
+              onMouseDown={onMouseDown}
+              onMouseMove={onMouseMove}
+              onMouseUp={onMouseUp}
+              onMouseLeave={() => {
+                cursorPos.current = null;
+                if (drawing.current) {
+                  drawing.current = false;
+                  dragMode.current = null;
+                  renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+                } else {
+                  renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+                }
+              }}
+            />
+          </div>
         </div>
 
-        {/* ── Right: layers panel ──────────────────────────────────────────── */}
+        {/* -- Right: layers panel -- */}
         <div style={S.panel}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
             <p style={S.label}>LAYERS</p>
@@ -1385,7 +1570,7 @@ export default function PaintEditor() {
                   style={{ ...S.smallBtn(layer.visible ? '#000' : '#eee', layer.visible ? '#fff' : '#000'), fontSize: 10, padding: '1px 4px' }}
                   onClick={(e) => { e.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}
                 >
-                  {layer.visible ? '👁' : '○'}
+                  {layer.visible ? '\uD83D\uDC41' : '\u25CB'}
                 </button>
                 <input
                   value={layer.name}
@@ -1395,9 +1580,9 @@ export default function PaintEditor() {
                 />
               </div>
               <div style={{ display: 'flex', gap: 3 }}>
-                <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 1); }}>↑</button>
-                <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, -1); }}>↓</button>
-                <button style={S.smallBtn('#f44', '#fff')} onClick={(e) => { e.stopPropagation(); deleteLayer(layer.id); }}>✕</button>
+                <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 1); }}>{'\u2191'}</button>
+                <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, -1); }}>{'\u2193'}</button>
+                <button style={S.smallBtn('#f44', '#fff')} onClick={(e) => { e.stopPropagation(); deleteLayer(layer.id); }}>{'\u2715'}</button>
               </div>
               <div style={{ marginTop: 4 }}>
                 <label style={{ ...S.label, fontSize: 9 }}>Opacity: {Math.round(layer.opacity * 100)}%</label>
