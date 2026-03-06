@@ -623,24 +623,18 @@ export default function PaintEditor() {
     };
   }
 
-  /** Get the composite of all layers up to (and including) targetLayerId, for flood fill reading */
-  function getCompositeCtx(targetLayerId: string): CanvasRenderingContext2D {
+  /** Get a composite of only the target layer's content (pixels + objects) for flood fill boundary reading */
+  function getLayerCtx(targetLayerId: string): CanvasRenderingContext2D {
     const dw = docWRef.current, dh = docHRef.current;
     const tc = getTempCanvas('__fill_composite__');
     const ctx = tc.getContext('2d')!;
     ctx.clearRect(0, 0, dw, dh);
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, dw, dh);
-    for (const layer of layersRef.current) {
-      if (!layer.visible) continue;
-      const pc = pixelCanvases.current.get(layer.id);
-      if (pc) {
-        ctx.drawImage(pc, 0, 0);
-        objectsRef.current
-          .filter((o) => o.layerId === layer.id)
-          .forEach((o) => drawObj(ctx, o, imageCache.current));
-      }
-      if (layer.id === targetLayerId) break;
+    const pc = pixelCanvases.current.get(targetLayerId);
+    if (pc) {
+      ctx.drawImage(pc, 0, 0);
+      objectsRef.current
+        .filter((o) => o.layerId === targetLayerId)
+        .forEach((o) => drawObj(ctx, o, imageCache.current));
     }
     return ctx;
   }
@@ -717,7 +711,7 @@ export default function PaintEditor() {
 
     if (t === 'fill') {
       saveHistory();
-      const compCtx = getCompositeCtx(al);
+      const compCtx = getLayerCtx(al);
       floodFill(compCtx, ctx, pos.x, pos.y, colorRef.current, opacityRef.current);
       renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
       drawing.current = false;
@@ -1527,8 +1521,9 @@ export default function PaintEditor() {
         </div>
 
         {/* -- Center: canvas -- */}
-        <div ref={canvasContainerRef} style={{ border: '3px solid #000', boxShadow: '5px 5px 0 #000', overflow: 'auto', maxHeight: '78vh', background: '#888' }}>
-          <div style={{ width: docW * zoom, height: docH * zoom, position: 'relative', lineHeight: 0 }}>
+        <div ref={canvasContainerRef} style={{ overflow: 'auto', maxHeight: '78vh' }}>
+          <div style={{ width: 'fit-content', margin: '0 auto', border: '3px solid #000', boxShadow: '5px 5px 0 #000', lineHeight: 0 }}>
+          <div style={{ width: docW * zoom, height: docH * zoom, position: 'relative' }}>
             {/* Display (composite) */}
             <canvas ref={displayRef} width={docW} height={docH}
               style={{ display: 'block', width: '100%', height: '100%', pointerEvents: 'none' }} />
@@ -1549,6 +1544,7 @@ export default function PaintEditor() {
                 }
               }}
             />
+          </div>
           </div>
         </div>
 
