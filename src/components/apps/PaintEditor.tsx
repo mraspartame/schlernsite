@@ -405,6 +405,9 @@ export default function PaintEditor() {
   // Paste dialog
   const [pasteDialog, setPasteDialog] = useState<string | null>(null);
 
+  // Layer thumbnail hover popup
+  const [thumbPopup, setThumbPopup] = useState<{ layerId: string; x: number; y: number } | null>(null);
+
   // ── Refs (always-fresh values for event callbacks) ─────────────────────────
   const layersRef = useRef(layers);           layersRef.current = layers;
   const objectsRef = useRef(objects);         objectsRef.current = objects;
@@ -427,6 +430,10 @@ export default function PaintEditor() {
   /** Per-layer temp canvas for compositing pixels + objects */
   const tempCanvases = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
+  /** Per-layer thumbnail canvas elements (in layers panel) */
+  const thumbnailRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const popupCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Interaction state (refs to avoid stale closures in handlers) ───────────
   const drawing = useRef(false);
@@ -616,7 +623,69 @@ export default function PaintEditor() {
       overlay.setLineDash([]);
       overlay.restore();
     }
+    updateThumbnails();
   }, []);
+
+  // ── Layer thumbnails ───────────────────────────────────────────────────────
+
+  function updateThumbnails() {
+    const dw = docWRef.current, dh = docHRef.current;
+    if (!dw || !dh) return;
+    const SZ = 64; // square canvas resolution
+    for (const layer of layersRef.current) {
+      const tc = thumbnailRefs.current.get(layer.id);
+      if (!tc) continue;
+      if (tc.width !== SZ || tc.height !== SZ) { tc.width = SZ; tc.height = SZ; }
+      renderLayerIntoCanvas(tc, layer.id, dw, dh, SZ, SZ);
+    }
+  }
+
+  function renderLayerIntoCanvas(
+    tc: HTMLCanvasElement,
+    layerId: string,
+    dw: number, dh: number,
+    outW: number, outH: number,
+  ) {
+    const ctx = tc.getContext('2d')!;
+    // Checkerboard background
+    const cell = Math.max(4, Math.round(outW / 12));
+    for (let ty = 0; ty < outH; ty += cell) {
+      for (let tx = 0; tx < outW; tx += cell) {
+        ctx.fillStyle = (Math.floor(tx / cell) + Math.floor(ty / cell)) % 2 === 0 ? '#bbb' : '#fff';
+        ctx.fillRect(tx, ty, cell, cell);
+      }
+    }
+    // Contain-fit: scale doc to fill outW x outH while preserving aspect ratio
+    const scale = Math.min(outW / dw, outH / dh);
+    const tw = Math.round(dw * scale);
+    const th = Math.round(dh * scale);
+    const ox = Math.round((outW - tw) / 2);
+    const oy = Math.round((outH - th) / 2);
+    const pc = pixelCanvases.current.get(layerId);
+    if (pc) ctx.drawImage(pc, ox, oy, tw, th);
+    const sx = tw / dw, sy = th / dh;
+    ctx.save();
+    ctx.translate(ox, oy);
+    objectsRef.current
+      .filter((o) => o.layerId === layerId)
+      .forEach((o) => {
+        ctx.save();
+        ctx.scale(sx, sy);
+        drawObj(ctx, o, imageCache.current);
+        ctx.restore();
+      });
+    ctx.restore();
+  }
+
+  function renderPopupPreview(layerId: string) {
+    const dw = docWRef.current, dh = docHRef.current;
+    if (!dw || !dh || !popupCanvasRef.current) return;
+    const POP_W = 240, POP_H = 160;
+    const pc_canvas = popupCanvasRef.current;
+    pc_canvas.width = POP_W;
+    pc_canvas.height = POP_H;
+    renderLayerIntoCanvas(pc_canvas, layerId, dw, dh, POP_W, POP_H);
+  }
 
   // ── History ────────────────────────────────────────────────────────────────
 
@@ -1282,6 +1351,13 @@ export default function PaintEditor() {
     renderAll(layers, objects, selectedId);
   }, [layers, objects, selectedId, docW, docH, renderAll]);
 
+  // Render popup preview after the popup canvas is mounted
+  useEffect(() => {
+    if (thumbPopup) {
+      renderPopupPreview(thumbPopup.layerId);
+    }
+  }, [thumbPopup]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
@@ -1621,24 +1697,49 @@ export default function PaintEditor() {
               onClick={() => setActiveLayerId(layer.id)}
               style={{ border: `2px solid ${activeLayerId === layer.id ? '#000' : '#ccc'}`, background: activeLayerId === layer.id ? '#f0f0f0' : '#fff', padding: '6px 8px', marginBottom: 4, cursor: 'pointer' }}
             >
-              <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 4 }}>
-                <button
-                  style={{ ...S.smallBtn(layer.visible ? '#000' : '#eee', layer.visible ? '#fff' : '#000'), fontSize: 10, padding: '1px 4px' }}
-                  onClick={(e) => { e.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}
+              {/* Top row: controls + square thumbnail */}
+              <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start', marginBottom: 4 }}>
+                {/* Left: name + buttons */}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 3 }}>
+                    <button
+                      style={{ ...S.smallBtn(layer.visible ? '#000' : '#eee', layer.visible ? '#fff' : '#000'), fontSize: 10, padding: '1px 4px' }}
+                      onClick={(e) => { e.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}
+                    >
+                      {layer.visible ? '\uD83D\uDC41' : '\u25CB'}
+                    </button>
+                    <input
+                      value={layer.name}
+                      onChange={(e) => updateLayer(layer.id, { name: e.target.value })}
+                      onClick={(e) => e.stopPropagation()}
+                      style={{ border: 'none', background: 'transparent', fontSize: 11, fontFamily: 'Poppins, sans-serif', fontWeight: 700, flex: 1, minWidth: 0, padding: 0 }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', gap: 3 }}>
+                    <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 1); }}>{'\u2191'}</button>
+                    <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, -1); }}>{'\u2193'}</button>
+                    <button style={S.smallBtn('#f44', '#fff')} onClick={(e) => { e.stopPropagation(); deleteLayer(layer.id); }}>{'\u2715'}</button>
+                  </div>
+                </div>
+                {/* Right: square thumbnail with hover popup */}
+                <div
+                  style={{ position: 'relative', flexShrink: 0 }}
+                  onMouseEnter={(e) => {
+                    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                    hoverTimerRef.current = setTimeout(() => {
+                      setThumbPopup({ layerId: layer.id, x: rect.left, y: rect.top });
+                    }, 500);
+                  }}
+                  onMouseLeave={() => {
+                    if (hoverTimerRef.current) { clearTimeout(hoverTimerRef.current); hoverTimerRef.current = null; }
+                    setThumbPopup(null);
+                  }}
                 >
-                  {layer.visible ? '\uD83D\uDC41' : '\u25CB'}
-                </button>
-                <input
-                  value={layer.name}
-                  onChange={(e) => updateLayer(layer.id, { name: e.target.value })}
-                  onClick={(e) => e.stopPropagation()}
-                  style={{ border: 'none', background: 'transparent', fontSize: 11, fontFamily: 'Poppins, sans-serif', fontWeight: 700, flex: 1, padding: 0 }}
-                />
-              </div>
-              <div style={{ display: 'flex', gap: 3 }}>
-                <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, 1); }}>{'\u2191'}</button>
-                <button style={S.smallBtn()} onClick={(e) => { e.stopPropagation(); moveLayer(layer.id, -1); }}>{'\u2193'}</button>
-                <button style={S.smallBtn('#f44', '#fff')} onClick={(e) => { e.stopPropagation(); deleteLayer(layer.id); }}>{'\u2715'}</button>
+                  <canvas
+                    ref={(el) => { if (el) thumbnailRefs.current.set(layer.id, el); else thumbnailRefs.current.delete(layer.id); }}
+                    style={{ display: 'block', width: 40, height: 40, border: '1px solid #ccc' }}
+                  />
+                </div>
               </div>
               <div style={{ marginTop: 4 }}>
                 <label style={{ ...S.label, fontSize: 9 }}>Opacity: {Math.round(layer.opacity * 100)}%</label>
@@ -1660,6 +1761,27 @@ export default function PaintEditor() {
               </div>
             </div>
           ))}
+
+          {/* Thumbnail hover popup */}
+          {thumbPopup && (
+            <div
+              style={{
+                position: 'fixed',
+                top: thumbPopup.y,
+                left: thumbPopup.x - 248,
+                zIndex: 9999,
+                border: '2px solid #000',
+                boxShadow: '4px 4px 0 #000',
+                background: '#fff',
+                pointerEvents: 'none',
+              }}
+            >
+              <canvas
+                ref={popupCanvasRef}
+                style={{ display: 'block', width: 240, height: 160 }}
+              />
+            </div>
+          )}
         </div>
       </div>
     </div>
