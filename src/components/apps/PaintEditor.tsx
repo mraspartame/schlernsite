@@ -198,6 +198,7 @@ function drawObj(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<strin
     case 'rect':
       ctx.strokeStyle = o.strokeColor ?? '#000';
       ctx.lineWidth = o.strokeWidth ?? 2;
+      ctx.lineJoin = 'miter';
       ctx.beginPath();
       ctx.rect(o.x, o.y, o.w, o.h);
       ctx.stroke();
@@ -243,10 +244,15 @@ function floodFill(
   px: number, py: number,
   hex: string, opacity: number,
 ) {
-  const CW = readCtx.canvas.width, CH = readCtx.canvas.height;
-  const readImg = readCtx.getImageData(0, 0, CW, CH);
-  const writeImg = writeCtx.getImageData(0, 0, CW, CH);
-  const rd = readImg.data, wd = writeImg.data;
+  // Use write canvas dimensions as the authoritative size
+  const CW = writeCtx.canvas.width, CH = writeCtx.canvas.height;
+
+  // Build a fresh read canvas to avoid any stale context state
+  const freshRead = document.createElement('canvas');
+  freshRead.width = CW; freshRead.height = CH;
+  const freshCtx = freshRead.getContext('2d')!;
+  freshCtx.drawImage(readCtx.canvas, 0, 0, CW, CH);
+  const rd = freshCtx.getImageData(0, 0, CW, CH).data;
 
   const ix = Math.round(Math.min(Math.max(px, 0), CW - 1));
   const iy = Math.round(Math.min(Math.max(py, 0), CH - 1));
@@ -262,28 +268,82 @@ function floodFill(
   if (tr === fr && tg === fg && tb === fb && ta === fa) return;
 
   const TOL = 80;
-  const matches = (i: number) =>
-    Math.abs(rd[i] - tr) <= TOL &&
-    Math.abs(rd[i + 1] - tg) <= TOL &&
-    Math.abs(rd[i + 2] - tb) <= TOL &&
-    Math.abs(rd[i + 3] - ta) <= TOL;
+  const matchesAt = (pi: number) => {
+    const i = pi * 4;
+    return Math.abs(rd[i] - tr) <= TOL &&
+      Math.abs(rd[i + 1] - tg) <= TOL &&
+      Math.abs(rd[i + 2] - tb) <= TOL &&
+      Math.abs(rd[i + 3] - ta) <= TOL;
+  };
 
+  // Build fill mask using scanline flood fill
+  const fillImg = new ImageData(CW, CH);
+  const fd = fillImg.data;
   const visited = new Uint8Array(CW * CH);
-  const stack = [i0];
+  const stack: [number, number][] = [[ix, iy]];
 
   while (stack.length) {
-    const i = stack.pop()!;
-    const pi = i >> 2;
-    if (visited[pi] || !matches(i)) continue;
-    visited[pi] = 1;
-    wd[i] = fr; wd[i + 1] = fg; wd[i + 2] = fb; wd[i + 3] = fa;
-    const x = pi % CW, y = Math.floor(pi / CW);
-    if (x > 0) stack.push(i - 4);
-    if (x < CW - 1) stack.push(i + 4);
-    if (y > 0) stack.push(i - CW * 4);
-    if (y < CH - 1) stack.push(i + CW * 4);
+    const [sx, sy] = stack.pop()!;
+    const pi0 = sy * CW + sx;
+    if (visited[pi0] || !matchesAt(pi0)) continue;
+
+    let xl = sx;
+    while (xl > 0 && !visited[sy * CW + xl - 1] && matchesAt(sy * CW + xl - 1)) xl--;
+
+    let x = xl;
+    let aboveOpen = false, belowOpen = false;
+    while (x < CW && !visited[sy * CW + x] && matchesAt(sy * CW + x)) {
+      const pi = sy * CW + x;
+      visited[pi] = 1;
+      const bi = pi * 4;
+      fd[bi] = fr; fd[bi + 1] = fg; fd[bi + 2] = fb; fd[bi + 3] = fa;
+
+      if (sy > 0) {
+        const above = (sy - 1) * CW + x;
+        if (!visited[above] && matchesAt(above)) {
+          if (!aboveOpen) { stack.push([x, sy - 1]); aboveOpen = true; }
+        } else { aboveOpen = false; }
+      }
+
+      if (sy < CH - 1) {
+        const below = (sy + 1) * CW + x;
+        if (!visited[below] && matchesAt(below)) {
+          if (!belowOpen) { stack.push([x, sy + 1]); belowOpen = true; }
+        } else { belowOpen = false; }
+      }
+
+      x++;
+    }
   }
-  writeCtx.putImageData(writeImg, 0, 0);
+
+  // 1-pixel dilation: expand fill into anti-aliased boundary fringe pixels that
+  // were blocked only because two edges combined to exceed TOL (e.g. rect corners).
+  // Only dilate into pixels that are NOT solid boundaries (not fully opaque non-target color).
+  const isSolidBoundary = (pi: number) => {
+    const i = pi * 4;
+    // A pixel is a solid boundary if it's significantly different from the target in alpha AND rgb
+    return Math.abs(rd[i + 3] - ta) > 200 ||
+      (Math.abs(rd[i] - tr) > 200 && Math.abs(rd[i + 1] - tg) > 200 && Math.abs(rd[i + 2] - tb) > 200);
+  };
+  for (let y = 0; y < CH; y++) {
+    for (let x = 0; x < CW; x++) {
+      const pi = y * CW + x;
+      if (visited[pi]) continue;
+      // Dilate if adjacent to a filled pixel and not a solid boundary
+      if (isSolidBoundary(pi)) continue;
+      if ((x > 0 && visited[pi - 1]) || (x < CW - 1 && visited[pi + 1]) ||
+          (y > 0 && visited[pi - CW]) || (y < CH - 1 && visited[pi + CW])) {
+        const bi = pi * 4;
+        fd[bi] = fr; fd[bi + 1] = fg; fd[bi + 2] = fb; fd[bi + 3] = fa;
+      }
+    }
+  }
+
+  // Composite fill onto write canvas via a temp canvas (avoids putImageData on writeCtx)
+  const fillCanvas = document.createElement('canvas');
+  fillCanvas.width = CW; fillCanvas.height = CH;
+  fillCanvas.getContext('2d')!.putImageData(fillImg, 0, 0);
+  writeCtx.drawImage(fillCanvas, 0, 0);
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
