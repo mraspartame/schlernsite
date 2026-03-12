@@ -8,7 +8,8 @@ const HANDLE_SZ = 8;  // visual size of handles (px)
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Tool = 'select' | 'pencil' | 'eraser' | 'fill' | 'line' | 'rect' | 'ellipse' | 'text' | 'crop';
+type Tool = 'select' | 'pencil' | 'eraser' | 'fill' | 'line' | 'rect' | 'ellipse' | 'text' | 'crop' | 'smart-select';
+type SamStatus = 'unloaded' | 'downloading' | 'ready' | 'inferring';
 type BlendMode = 'source-over' | 'multiply' | 'screen' | 'overlay';
 type HandlePos = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
@@ -408,6 +409,15 @@ export default function PaintEditor() {
   // Layer thumbnail hover popup
   const [thumbPopup, setThumbPopup] = useState<{ layerId: string; x: number; y: number } | null>(null);
 
+  // Smart Select / SAM
+  const [samStatus, setSamStatus] = useState<SamStatus>('unloaded');
+  const [smartSelectDownloadPopup, setSmartSelectDownloadPopup] = useState(false);
+  const [samActionPopup, setSamActionPopup] = useState<{ screenX: number; screenY: number } | null>(null);
+  const [useGrabCut, setUseGrabCut] = useState(() => localStorage.getItem('paint_grabcut') === '1');
+
+  // Settings popup
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
   // ── Refs (always-fresh values for event callbacks) ─────────────────────────
   const layersRef = useRef(layers);           layersRef.current = layers;
   const objectsRef = useRef(objects);         objectsRef.current = objects;
@@ -434,6 +444,18 @@ export default function PaintEditor() {
   const thumbnailRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const popupCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // SAM refs
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const samModelRef = useRef<any>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const samProcessorRef = useRef<any>(null);
+  const samStatusRef = useRef<SamStatus>('unloaded');
+  const samMaskRef = useRef<{ data: boolean[]; dw: number; dh: number } | null>(null);
+  const samClickLayerRef = useRef<string | null>(null);
+  /** Stroke points accumulated while user highlights in smart-select mode */
+  const samStrokeRef = useRef<{ x: number; y: number }[]>([]);
+  const useGrabCutRef = useRef(false); useGrabCutRef.current = useGrabCut;
 
   // ── Interaction state (refs to avoid stale closures in handlers) ───────────
   const drawing = useRef(false);
@@ -623,6 +645,38 @@ export default function PaintEditor() {
       overlay.setLineDash([]);
       overlay.restore();
     }
+
+    // SAM mask overlay
+    if (samMaskRef.current) {
+      const { data, dw: mdw, dh: mdh } = samMaskRef.current;
+      const imgData = overlay.createImageData(mdw, mdh);
+      for (let i = 0; i < data.length; i++) {
+        if (data[i]) {
+          imgData.data[i * 4]     = 0;
+          imgData.data[i * 4 + 1] = 120;
+          imgData.data[i * 4 + 2] = 255;
+          imgData.data[i * 4 + 3] = 110;
+        }
+      }
+      overlay.putImageData(imgData, 0, 0);
+    }
+
+    // SAM stroke highlight preview
+    if (samStrokeRef.current.length > 1) {
+      const pts = samStrokeRef.current;
+      overlay.save();
+      overlay.globalAlpha = 0.45;
+      overlay.strokeStyle = '#facc15';
+      overlay.lineWidth = 18;
+      overlay.lineCap = 'round';
+      overlay.lineJoin = 'round';
+      overlay.beginPath();
+      overlay.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) overlay.lineTo(pts[i].x, pts[i].y);
+      overlay.stroke();
+      overlay.restore();
+    }
+
     updateThumbnails();
   }, []);
 
@@ -685,6 +739,609 @@ export default function PaintEditor() {
     pc_canvas.width = POP_W;
     pc_canvas.height = POP_H;
     renderLayerIntoCanvas(pc_canvas, layerId, dw, dh, POP_W, POP_H);
+  }
+
+  // ── Smart Select / SAM ─────────────────────────────────────────────────────
+
+  async function loadSamModel() {
+    setSamStatus('downloading');
+    samStatusRef.current = 'downloading';
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const tf = await import('@huggingface/transformers') as any;
+      samProcessorRef.current = await tf.SamProcessor.from_pretrained('Xenova/sam-vit-base');
+      samModelRef.current = await tf.SamModel.from_pretrained('Xenova/sam-vit-base', { dtype: 'q8' });
+      localStorage.setItem('paint_sam_ready', '1');
+      setSamStatus('ready');
+      samStatusRef.current = 'ready';
+    } catch (err) {
+      console.error('SAM load failed:', err);
+      setSamStatus('unloaded');
+      samStatusRef.current = 'unloaded';
+    }
+  }
+
+async function runSmartSelect(
+    points: { x: number; y: number }[],
+    screenX: number,
+    screenY: number,
+    layerId: string,
+    strokeBbox: [number, number, number, number],
+  ) {
+    const model = samModelRef.current;
+    const processor = samProcessorRef.current;
+    if (!model || !processor) return;
+    setSamStatus('inferring');
+    samStatusRef.current = 'inferring';
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { RawImage } = await import('@huggingface/transformers') as any;
+      const dw = docWRef.current, dh = docHRef.current;
+
+      // Composite the layer content into a temp canvas for SAM input
+      const tc = getTempCanvas('__sam_input__');
+      tc.width = dw; tc.height = dh;
+      const tcCtx = tc.getContext('2d')!;
+      tcCtx.clearRect(0, 0, dw, dh);
+      tcCtx.fillStyle = '#fff';
+      tcCtx.fillRect(0, 0, dw, dh);
+      const pc = pixelCanvases.current.get(layerId);
+      if (pc) tcCtx.drawImage(pc, 0, 0);
+      objectsRef.current
+        .filter((o) => o.layerId === layerId)
+        .forEach((o) => drawObj(tcCtx, o, imageCache.current));
+
+      const image = await RawImage.fromCanvas(tc);
+      console.log('[SAM] image size:', image.width, 'x', image.height, '| doc:', dw, 'x', dh);
+      console.log('[SAM] positive points:', points.map(p => `(${p.x.toFixed(1)}, ${p.y.toFixed(1)})`));
+      console.log('[SAM] strokeBbox:', strokeBbox);
+
+
+      // Negative points: canvas corners, but skip any that are inside or near
+      // the stroke bbox (the user may be selecting an object at the canvas edge)
+      const PAD = 80; // min distance from stroke bbox to use a corner as negative
+      const [sbx1_, sby1_, sbx2_, sby2_] = strokeBbox;
+      const allCorners: [number, number][] = [[0, 0], [dw, 0], [0, dh], [dw, dh]];
+      const negatives = allCorners.filter(([cx, cy]) =>
+        cx < sbx1_ - PAD || cx > sbx2_ + PAD || cy < sby1_ - PAD || cy > sby2_ + PAD
+      );
+      console.log(`[SAM] using ${negatives.length}/4 corner negatives (skipped corners near stroke)`);
+      const allPts = [...points.map((p): [number, number] => [p.x, p.y]), ...negatives];
+      const allLabels = [...points.map(() => 1), ...negatives.map(() => 0)];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      // Note: input_boxes is NOT passed — Transformers.js SAM silently drops it
+      // ("Too many inputs, 5 > 4"). We apply bbox clipping in post-processing instead.
+      const prompt: any = { input_points: [allPts], input_labels: [allLabels] };
+      console.log('[SAM] prompt:', JSON.stringify(prompt));
+      const inputs = await processor(image, prompt);
+      console.log('[SAM] inputs keys:', Object.keys(inputs));
+      console.log('[SAM] original_sizes:', inputs.original_sizes?.tolist?.() ?? inputs.original_sizes);
+      console.log('[SAM] reshaped_input_sizes:', inputs.reshaped_input_sizes?.tolist?.() ?? inputs.reshaped_input_sizes);
+      const outputs = await model(inputs);
+      console.log('[SAM] outputs keys:', Object.keys(outputs));
+      console.log('[SAM] pred_masks shape:', outputs.pred_masks?.dims ?? outputs.pred_masks?.shape ?? 'unknown');
+      console.log('[SAM] iou_scores shape:', outputs.iou_scores?.dims ?? outputs.iou_scores?.shape ?? 'unknown');
+      console.log('[SAM] iou_scores data:', Array.from(outputs.iou_scores.data as Float32Array));
+
+      const masks = await processor.post_process_masks(
+        outputs.pred_masks,
+        inputs.original_sizes,
+        inputs.reshaped_input_sizes,
+      );
+      // masks[0] is a tensor of shape [1, 3, H, W] — need masks[0][0] to get [3, H, W]
+      const maskBatch = masks[0];
+      console.log('[SAM] masks structure: masks.length=', masks.length,
+        '| masks[0] dims:', maskBatch?.dims ?? 'unknown');
+      const maskSet = maskBatch[0]; // shape [3, H, W]
+      console.log('[SAM] maskSet (masks[0][0]) dims:', maskSet?.dims ?? 'unknown');
+
+      // Inspect each mask
+      const iouScores = outputs.iou_scores.data as Float32Array;
+      const [sbx1, sby1, sbx2, sby2] = strokeBbox;
+      const numMasks = 3;
+
+      for (let m = 0; m < numMasks; m++) {
+        let mData: Uint8Array | Float32Array | null = null;
+        let mLen = 0;
+        try {
+          const mTensor = maskSet[m]; // shape [H, W]
+          mData = mTensor.data as Uint8Array | Float32Array;
+          mLen = mData.length;
+          console.log(`[SAM] mask[${m}] dims:`, mTensor.dims ?? mTensor.shape ?? 'unknown', '| data.length:', mLen, `| expected: ${dw * dh}`);
+        } catch (e) {
+          console.error(`[SAM] mask[${m}] access error:`, e);
+        }
+        if (mData) {
+          let trueCount = 0, inside = 0;
+          let minVal = Infinity, maxVal = -Infinity;
+          for (let i = 0; i < mData.length; i++) {
+            const v = mData[i];
+            if (v < minVal) minVal = v;
+            if (v > maxVal) maxVal = v;
+            if (v > 0.5) {
+              trueCount++;
+              const px = i % dw, py = Math.floor(i / dw);
+              if (px >= sbx1 && px <= sbx2 && py >= sby1 && py <= sby2) inside++;
+            }
+          }
+          const containment = trueCount > 0 ? inside / trueCount : 0;
+          const score = iouScores[m] * containment;
+          console.log(`[SAM] mask[${m}]: truePixels=${trueCount}/${mLen} (${(trueCount/mLen*100).toFixed(1)}%), inside bbox=${inside}, containment=${containment.toFixed(4)}, iou=${iouScores[m]?.toFixed(4)}, score=${score.toFixed(6)}, valueRange=[${minVal}, ${maxVal}]`);
+        }
+      }
+
+      // Pick best mask using two-tier scoring:
+      // Tier 1: Masks with >95% containment are "precise" — prefer them, break
+      //         ties by coverage*iou (how much of the stroke bbox they fill).
+      // Tier 2: Masks with lower containment use containment*coverage*iou.
+      // This avoids both problems: masks that spill outside the stroke (mountains)
+      // AND tiny masks that are trivially 100% contained (single window).
+      const bboxArea = Math.max(1, (sbx2 - sbx1) * (sby2 - sby1));
+      let bestIdx = 0;
+      let bestScore = -1;
+      for (let m = 0; m < numMasks; m++) {
+        const mTensor = maskSet[m];
+        const mData = mTensor.data as Uint8Array | Float32Array;
+        let inside = 0, total = 0;
+        for (let i = 0; i < mData.length; i++) {
+          if (mData[i] > 0.5) {
+            total++;
+            const px = i % dw, py = Math.floor(i / dw);
+            if (px >= sbx1 && px <= sbx2 && py >= sby1 && py <= sby2) inside++;
+          }
+        }
+        const containment = total > 0 ? inside / total : 0;
+        const coverage = inside / bboxArea; // how much of stroke bbox is filled
+        const iou = iouScores[m];
+        if (iou < 0.5) continue;
+        // Tier 1 masks (tightly contained) get a large bonus so they always win
+        const score = containment >= 0.95
+          ? 1000 + coverage * iou
+          : containment * coverage * iou;
+        console.log(`[SAM] mask[${m}] scoring: containment=${containment.toFixed(4)}, coverage=${coverage.toFixed(4)}, iou=${iou.toFixed(4)}, tier=${containment >= 0.95 ? 1 : 2}, score=${score.toFixed(6)}`);
+        if (score > bestScore) { bestScore = score; bestIdx = m; }
+      }
+      console.log(`[SAM] SELECTED mask[${bestIdx}] with score=${bestScore.toFixed(6)}`);
+
+      const maskTensor = maskSet[bestIdx];
+      const maskData = maskTensor.data as Uint8Array | Float32Array;
+      const maskBool: boolean[] = new Array(dw * dh).fill(false);
+      // Clip mask to stroke bounding box — this is our spatial constraint
+      // since Transformers.js SAM ignores input_boxes.
+      const clipX1 = Math.max(0, Math.floor(sbx1));
+      const clipY1 = Math.max(0, Math.floor(sby1));
+      const clipX2 = Math.min(dw - 1, Math.ceil(sbx2));
+      const clipY2 = Math.min(dh - 1, Math.ceil(sby2));
+      let clippedCount = 0;
+      for (let i = 0; i < maskData.length; i++) {
+        if (maskData[i] > 0.5) {
+          const px = i % dw, py = Math.floor(i / dw);
+          if (px >= clipX1 && px <= clipX2 && py >= clipY1 && py <= clipY2) {
+            maskBool[i] = true;
+          } else {
+            clippedCount++;
+          }
+        }
+      }
+      console.log(`[SAM] bbox clip removed ${clippedCount} pixels outside stroke region`);
+
+      // Morphological close (dilate then erode) to close small boundary gaps.
+      // SAM's 256x256 internal mask upscaled to full res leaves thin gaps along
+      // edges — this seals them so hole-fill can then solidify the interior.
+      // Uses separable box filters: O(w*h) per pass, 4 passes total.
+      const CLOSE_R = 6;
+      {
+        const N = dw * dh;
+        const m = new Uint8Array(N);
+        for (let i = 0; i < N; i++) m[i] = maskBool[i] ? 1 : 0;
+
+        // --- Dilate (any pixel in window is true → true) ---
+        const dh1 = new Uint8Array(N); // horizontal pass
+        for (let y = 0; y < dh; y++) {
+          const row = y * dw;
+          let cnt = 0;
+          for (let x = 0; x <= Math.min(CLOSE_R, dw - 1); x++) cnt += m[row + x];
+          dh1[row] = cnt > 0 ? 1 : 0;
+          for (let x = 1; x < dw; x++) {
+            if (x + CLOSE_R < dw) cnt += m[row + x + CLOSE_R];
+            if (x - CLOSE_R - 1 >= 0) cnt -= m[row + x - CLOSE_R - 1];
+            dh1[row + x] = cnt > 0 ? 1 : 0;
+          }
+        }
+        const dilated = new Uint8Array(N); // vertical pass
+        for (let x = 0; x < dw; x++) {
+          let cnt = 0;
+          for (let y = 0; y <= Math.min(CLOSE_R, dh - 1); y++) cnt += dh1[y * dw + x];
+          dilated[x] = cnt > 0 ? 1 : 0;
+          for (let y = 1; y < dh; y++) {
+            if (y + CLOSE_R < dh) cnt += dh1[(y + CLOSE_R) * dw + x];
+            if (y - CLOSE_R - 1 >= 0) cnt -= dh1[(y - CLOSE_R - 1) * dw + x];
+            dilated[y * dw + x] = cnt > 0 ? 1 : 0;
+          }
+        }
+
+        // --- Erode (all pixels in window must be true → true) ---
+        const eh1 = new Uint8Array(N); // horizontal pass
+        for (let y = 0; y < dh; y++) {
+          const row = y * dw;
+          let cnt = 0;
+          const initEnd = Math.min(CLOSE_R, dw - 1);
+          for (let x = 0; x <= initEnd; x++) cnt += dilated[row + x];
+          eh1[row] = cnt === initEnd + 1 ? 1 : 0;
+          for (let x = 1; x < dw; x++) {
+            if (x + CLOSE_R < dw) cnt += dilated[row + x + CLOSE_R];
+            if (x - CLOSE_R - 1 >= 0) cnt -= dilated[row + x - CLOSE_R - 1];
+            const ws = Math.min(x + CLOSE_R, dw - 1) - Math.max(x - CLOSE_R, 0) + 1;
+            eh1[row + x] = cnt === ws ? 1 : 0;
+          }
+        }
+        // vertical pass → write back to maskBool
+        for (let x = 0; x < dw; x++) {
+          let cnt = 0;
+          const initEnd = Math.min(CLOSE_R, dh - 1);
+          for (let y = 0; y <= initEnd; y++) cnt += eh1[y * dw + x];
+          maskBool[x] = cnt === initEnd + 1;
+          for (let y = 1; y < dh; y++) {
+            if (y + CLOSE_R < dh) cnt += eh1[(y + CLOSE_R) * dw + x];
+            if (y - CLOSE_R - 1 >= 0) cnt -= eh1[(y - CLOSE_R - 1) * dw + x];
+            const ws = Math.min(y + CLOSE_R, dh - 1) - Math.max(y - CLOSE_R, 0) + 1;
+            maskBool[y * dw + x] = cnt === ws;
+          }
+        }
+
+        const afterClose = maskBool.filter(Boolean).length;
+        console.log(`[SAM] morph close (r=${CLOSE_R}): ${afterClose} true pixels`);
+      }
+
+      // Fill interior holes — flood-fill "outside" from all border pixels,
+      // then any unfilled non-mask pixel is an enclosed hole → fill it.
+      const outside = new Uint8Array(dw * dh);
+      const holeStack: number[] = [];
+      for (let x = 0; x < dw; x++) {
+        if (!maskBool[x]) { outside[x] = 1; holeStack.push(x); }
+        const bi = (dh - 1) * dw + x;
+        if (!maskBool[bi]) { outside[bi] = 1; holeStack.push(bi); }
+      }
+      for (let y = 1; y < dh - 1; y++) {
+        const li = y * dw;
+        if (!maskBool[li]) { outside[li] = 1; holeStack.push(li); }
+        const ri = y * dw + dw - 1;
+        if (!maskBool[ri]) { outside[ri] = 1; holeStack.push(ri); }
+      }
+      while (holeStack.length > 0) {
+        const idx = holeStack.pop()!;
+        const px = idx % dw, py = (idx - px) / dw;
+        for (const [nx, ny] of [[px+1,py],[px-1,py],[px,py+1],[px,py-1]]) {
+          if (nx < 0 || nx >= dw || ny < 0 || ny >= dh) continue;
+          const ni = ny * dw + nx;
+          if (!outside[ni] && !maskBool[ni]) { outside[ni] = 1; holeStack.push(ni); }
+        }
+      }
+      let holesFilled = 0;
+      for (let i = 0; i < dw * dh; i++) {
+        if (!maskBool[i] && !outside[i]) { maskBool[i] = true; holesFilled++; }
+      }
+      const finalTrueCount = maskBool.filter(Boolean).length;
+      console.log(`[SAM] final mask: ${finalTrueCount} true pixels, holes filled: ${holesFilled}`);
+
+      samMaskRef.current = { data: maskBool, dw, dh };
+      samClickLayerRef.current = layerId;
+      setSamActionPopup({ screenX, screenY });
+      setSamStatus('ready');
+      samStatusRef.current = 'ready';
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+    } catch (err) {
+      console.error('SAM inference failed:', err);
+      setSamStatus('ready');
+      samStatusRef.current = 'ready';
+    }
+  }
+
+  /** Extract masked pixels into a cropped dataURL; optionally erase from source pixel canvas */
+  function extractMaskedPixels(mask: { data: boolean[]; dw: number; dh: number }, layerId: string, eraseSource: boolean) {
+    const { dw, dh } = mask;
+    const pc = pixelCanvases.current.get(layerId);
+    if (!pc) return null;
+
+    const tc = getTempCanvas('__sam_extract__');
+    tc.width = dw; tc.height = dh;
+    const tcCtx = tc.getContext('2d')!;
+    tcCtx.clearRect(0, 0, dw, dh);
+    tcCtx.drawImage(pc, 0, 0);
+    objectsRef.current
+      .filter((o) => o.layerId === layerId)
+      .forEach((o) => drawObj(tcCtx, o, imageCache.current));
+
+    const fullImg = tcCtx.getImageData(0, 0, dw, dh);
+    const maskedImg = new ImageData(dw, dh);
+    let minX = dw, minY = dh, maxX = 0, maxY = 0;
+    for (let row = 0; row < dh; row++) {
+      for (let col = 0; col < dw; col++) {
+        const i = row * dw + col;
+        if (mask.data[i]) {
+          maskedImg.data[i * 4]     = fullImg.data[i * 4];
+          maskedImg.data[i * 4 + 1] = fullImg.data[i * 4 + 1];
+          maskedImg.data[i * 4 + 2] = fullImg.data[i * 4 + 2];
+          maskedImg.data[i * 4 + 3] = fullImg.data[i * 4 + 3];
+          if (col < minX) minX = col;
+          if (col > maxX) maxX = col;
+          if (row < minY) minY = row;
+          if (row > maxY) maxY = row;
+        }
+      }
+    }
+    if (minX > maxX || minY > maxY) return null;
+
+    const cropW = maxX - minX + 1, cropH = maxY - minY + 1;
+    const cropCanvas = document.createElement('canvas');
+    cropCanvas.width = cropW; cropCanvas.height = cropH;
+    cropCanvas.getContext('2d')!.putImageData(maskedImg, -minX, -minY);
+    const dataUrl = cropCanvas.toDataURL('image/png');
+
+    if (eraseSource) {
+      const pcCtx = pc.getContext('2d')!;
+      const srcImg = pcCtx.getImageData(0, 0, dw, dh);
+      for (let i = 0; i < mask.data.length; i++) {
+        if (mask.data[i]) srcImg.data[i * 4 + 3] = 0;
+      }
+      pcCtx.putImageData(srcImg, 0, 0);
+    }
+    return { dataUrl, x: minX, y: minY, w: cropW, h: cropH };
+  }
+
+  function clearSamSelection() {
+    samMaskRef.current = null;
+    samClickLayerRef.current = null;
+    setSamActionPopup(null);
+    renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+  }
+
+  function runGrabCutSegment(
+    stroke: { x: number; y: number }[],
+    layerId: string,
+  ): { data: boolean[]; dw: number; dh: number } | null {
+    const dw = docWRef.current, dh = docHRef.current;
+    if (!dw || !dh || stroke.length === 0) return null;
+
+    // Composite layer into a temp canvas
+    const tc = getTempCanvas('__grabcut__');
+    tc.width = dw; tc.height = dh;
+    const tcCtx = tc.getContext('2d')!;
+    tcCtx.clearRect(0, 0, dw, dh);
+    tcCtx.fillStyle = '#fff';
+    tcCtx.fillRect(0, 0, dw, dh);
+    const pc = pixelCanvases.current.get(layerId);
+    if (pc) tcCtx.drawImage(pc, 0, 0);
+    objectsRef.current.filter((o) => o.layerId === layerId).forEach((o) => drawObj(tcCtx, o, imageCache.current));
+    const pixels = tcCtx.getImageData(0, 0, dw, dh).data;
+
+    // Centroid (positive seed) and stroke bounding box
+    const cx = Math.round(stroke.reduce((s, p) => s + p.x, 0) / stroke.length);
+    const cy = Math.round(stroke.reduce((s, p) => s + p.y, 0) / stroke.length);
+    const xs = stroke.map((p) => p.x), ys = stroke.map((p) => p.y);
+    const bx1 = Math.max(0, Math.floor(Math.min(...xs)));
+    const by1 = Math.max(0, Math.floor(Math.min(...ys)));
+    const bx2 = Math.min(dw - 1, Math.ceil(Math.max(...xs)));
+    const by2 = Math.min(dh - 1, Math.ceil(Math.max(...ys)));
+    console.log(`[GrabCut] doc: ${dw}x${dh}, stroke points: ${stroke.length}`);
+    console.log(`[GrabCut] centroid: (${cx}, ${cy}), bbox: [${bx1}, ${by1}, ${bx2}, ${by2}]`);
+    console.log(`[GrabCut] bbox size: ${bx2 - bx1}x${by2 - by1} = ${(bx2-bx1)*(by2-by1)} pixels`);
+    // Log centroid pixel color
+    const cIdx = (cy * dw + cx) * 4;
+    console.log(`[GrabCut] centroid pixel color: rgb(${pixels[cIdx]}, ${pixels[cIdx+1]}, ${pixels[cIdx+2]})`);
+
+    // Sample FG colors along the stroke (slightly inward toward centroid)
+    // and around the centroid. Individual samples, NOT averaged — handles
+    // multi-colored objects like a person with skin, hair, and clothing.
+    const fgSamples: [number, number, number][] = [];
+    const step = Math.max(1, Math.floor(stroke.length / 40));
+    for (let i = 0; i < stroke.length; i += step) {
+      const p = stroke[i];
+      // 25% inward toward centroid to avoid sampling background at edges
+      const sx = Math.max(0, Math.min(dw - 1, Math.round(p.x + (cx - p.x) * 0.25)));
+      const sy = Math.max(0, Math.min(dh - 1, Math.round(p.y + (cy - p.y) * 0.25)));
+      const idx = (sy * dw + sx) * 4;
+      fgSamples.push([pixels[idx], pixels[idx + 1], pixels[idx + 2]]);
+    }
+    // Also sample a grid around the centroid
+    for (let dy = -15; dy <= 15; dy += 5) {
+      for (let dx = -15; dx <= 15; dx += 5) {
+        const x = Math.max(0, Math.min(dw - 1, cx + dx));
+        const y = Math.max(0, Math.min(dh - 1, cy + dy));
+        const idx = (y * dw + x) * 4;
+        fgSamples.push([pixels[idx], pixels[idx + 1], pixels[idx + 2]]);
+      }
+    }
+
+    // Sample BG colors from a ring outside the stroke bbox + canvas corners
+    const bgSamples: [number, number, number][] = [];
+    const PAD = 30;
+    const ox1 = Math.max(0, bx1 - PAD), oy1 = Math.max(0, by1 - PAD);
+    const ox2 = Math.min(dw - 1, bx2 + PAD), oy2 = Math.min(dh - 1, by2 + PAD);
+    for (let y = oy1; y <= oy2; y += 8) {
+      for (let x = ox1; x <= ox2; x += 8) {
+        if (x < bx1 || x > bx2 || y < by1 || y > by2) {
+          const idx = (y * dw + x) * 4;
+          bgSamples.push([pixels[idx], pixels[idx + 1], pixels[idx + 2]]);
+        }
+      }
+    }
+    for (const [x, y] of [[0, 0], [dw - 1, 0], [0, dh - 1], [dw - 1, dh - 1]]) {
+      const idx = (y * dw + x) * 4;
+      bgSamples.push([pixels[idx], pixels[idx + 1], pixels[idx + 2]]);
+    }
+    if (bgSamples.length === 0) bgSamples.push([128, 128, 128]);
+
+    console.log(`[GrabCut] FG samples: ${fgSamples.length}, BG samples: ${bgSamples.length}`);
+    console.log(`[GrabCut] FG sample colors (first 10):`, fgSamples.slice(0, 10).map(c => `rgb(${c[0]},${c[1]},${c[2]})`));
+    console.log(`[GrabCut] BG sample colors (first 10):`, bgSamples.slice(0, 10).map(c => `rgb(${c[0]},${c[1]},${c[2]})`));
+
+    // Per-pixel classification: closest FG sample vs closest BG sample.
+    // Checking nearest sample (not mean) handles multi-colored objects.
+    const classified = new Uint8Array(dw * dh); // 1 = likely foreground
+    for (let y = by1; y <= by2; y++) {
+      for (let x = bx1; x <= bx2; x++) {
+        const i = (y * dw + x) * 4;
+        const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+        let minFg = Infinity;
+        for (let s = 0; s < fgSamples.length; s++) {
+          const d = (r - fgSamples[s][0]) ** 2 + (g - fgSamples[s][1]) ** 2 + (b - fgSamples[s][2]) ** 2;
+          if (d < minFg) minFg = d;
+        }
+        let minBg = Infinity;
+        for (let s = 0; s < bgSamples.length; s++) {
+          const d = (r - bgSamples[s][0]) ** 2 + (g - bgSamples[s][1]) ** 2 + (b - bgSamples[s][2]) ** 2;
+          if (d < minBg) minBg = d;
+        }
+        classified[y * dw + x] = minFg <= minBg ? 1 : 0;
+      }
+    }
+
+    // Count classified pixels
+    let fgCount = 0, bgCount = 0;
+    for (let y = by1; y <= by2; y++) {
+      for (let x = bx1; x <= bx2; x++) {
+        if (classified[y * dw + x] === 1) fgCount++; else bgCount++;
+      }
+    }
+    const bboxArea = (bx2 - bx1 + 1) * (by2 - by1 + 1);
+    console.log(`[GrabCut] classified: FG=${fgCount} (${(fgCount/bboxArea*100).toFixed(1)}%), BG=${bgCount} (${(bgCount/bboxArea*100).toFixed(1)}%) within bbox`);
+
+    // DFS from centroid — 8-connectivity for better region cohesion
+    const result = new Uint8Array(dw * dh);
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    const startIdx = cy * dw + cx;
+    console.log(`[GrabCut] centroid classified as: ${classified[startIdx] === 1 ? 'FG' : 'BG'} (value=${classified[startIdx]})`);
+
+    function floodFill(seedIdx: number) {
+      const stack = [seedIdx];
+      classified[seedIdx] = 2;
+      while (stack.length > 0) {
+        const idx = stack.pop()!;
+        result[idx] = 1;
+        const px = idx % dw, py = Math.floor(idx / dw);
+        for (const [ddx, ddy] of dirs) {
+          const nx = px + ddx, ny = py + ddy;
+          if (nx < bx1 || nx > bx2 || ny < by1 || ny > by2) continue;
+          const ni = ny * dw + nx;
+          if (classified[ni] === 1) { classified[ni] = 2; stack.push(ni); }
+        }
+      }
+    }
+
+    if (classified[startIdx] !== 1) {
+      // Seed fell on a background pixel — find nearest FG pixel
+      let found = false;
+      outer: for (let r = 1; r <= 60; r++) {
+        for (let dy = -r; dy <= r; dy++) {
+          for (let dx = -r; dx <= r; dx++) {
+            if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+            const nx = cx + dx, ny = cy + dy;
+            if (nx < bx1 || nx > bx2 || ny < by1 || ny > by2) continue;
+            if (classified[ny * dw + nx] === 1) {
+              floodFill(ny * dw + nx);
+              found = true; break outer;
+            }
+          }
+        }
+      }
+      if (!found) return null;
+    } else {
+      floodFill(startIdx);
+    }
+
+    const data: boolean[] = new Array(dw * dh);
+    let finalCount = 0;
+    for (let i = 0; i < dw * dh; i++) { data[i] = result[i] === 1; if (data[i]) finalCount++; }
+    console.log(`[GrabCut] flood fill result: ${finalCount} pixels (${(finalCount / (dw*dh) * 100).toFixed(2)}% of canvas)`);
+    return { data, dw, dh };
+  }
+
+  function smartSelectDelete() {
+    const mask = samMaskRef.current;
+    const layerId = samClickLayerRef.current;
+    if (!mask || !layerId) return;
+    saveHistory();
+    const pc = pixelCanvases.current.get(layerId);
+    if (!pc) return;
+    const pcCtx = pc.getContext('2d')!;
+    const imgData = pcCtx.getImageData(0, 0, mask.dw, mask.dh);
+    for (let i = 0; i < mask.data.length; i++) {
+      if (mask.data[i]) imgData.data[i * 4 + 3] = 0;
+    }
+    pcCtx.putImageData(imgData, 0, 0);
+    clearSamSelection();
+    updateThumbnails();
+  }
+
+  function smartSelectToNewLayer() {
+    const mask = samMaskRef.current;
+    const layerId = samClickLayerRef.current;
+    if (!mask || !layerId) return;
+    saveHistory();
+    const extracted = extractMaskedPixels(mask, layerId, true);
+    if (!extracted) { clearSamSelection(); return; }
+
+    const { dataUrl, x, y, w, h } = extracted;
+    const newLayerId = uid();
+    const newLayer: Layer = { id: newLayerId, name: 'Selected Object', visible: true, opacity: 1, blendMode: 'source-over' };
+    const pc2 = document.createElement('canvas');
+    pc2.width = mask.dw; pc2.height = mask.dh;
+    pixelCanvases.current.set(newLayerId, pc2);
+    const newLayers = [...layersRef.current, newLayer];
+    layersRef.current = newLayers;
+    setLayers(newLayers);
+
+    const img = new Image();
+    img.onload = () => {
+      imageCache.current.set(dataUrl, img);
+      const newObj: PaintObj = {
+        id: uid(), layerId: newLayerId, type: 'image',
+        x, y, w, h, opacity: 1, src: dataUrl, lockAspect: true, naturalAr: w / h,
+      };
+      const next = [...objectsRef.current, newObj];
+      objectsRef.current = next;
+      setObjects(next);
+      setActiveLayerId(newLayerId);
+      setSelectedId(newObj.id);
+      selectedIdRef.current = newObj.id;
+      setTool('select');
+      toolRef.current = 'select';
+      clearSamSelection();
+      updateThumbnails();
+      renderAll(newLayers, next, newObj.id);
+    };
+    img.src = dataUrl;
+  }
+
+  function smartSelectMakeObject() {
+    const mask = samMaskRef.current;
+    const layerId = samClickLayerRef.current;
+    if (!mask || !layerId) return;
+    saveHistory();
+    const extracted = extractMaskedPixels(mask, layerId, true);
+    if (!extracted) { clearSamSelection(); return; }
+
+    const { dataUrl, x, y, w, h } = extracted;
+    const img = new Image();
+    img.onload = () => {
+      imageCache.current.set(dataUrl, img);
+      const newObj: PaintObj = {
+        id: uid(), layerId, type: 'image',
+        x, y, w, h, opacity: 1, src: dataUrl, lockAspect: true, naturalAr: w / h,
+      };
+      const next = [...objectsRef.current, newObj];
+      objectsRef.current = next;
+      setObjects(next);
+      setSelectedId(newObj.id);
+      selectedIdRef.current = newObj.id;
+      setTool('select');
+      toolRef.current = 'select';
+      clearSamSelection();
+      updateThumbnails();
+      renderAll(layersRef.current, next, newObj.id);
+    };
+    img.src = dataUrl;
   }
 
   // ── History ────────────────────────────────────────────────────────────────
@@ -833,6 +1490,28 @@ export default function PaintEditor() {
       return;
     }
 
+    if (t === 'smart-select') {
+      if (useGrabCutRef.current) {
+        // GrabCut needs no model — always ready
+        samStrokeRef.current = [pos];
+        return;
+      }
+      const status = samStatusRef.current;
+      if (status === 'downloading' || status === 'inferring') { drawing.current = false; return; }
+      if (status === 'unloaded') {
+        drawing.current = false;
+        if (localStorage.getItem('paint_sam_ready') === '1') {
+          loadSamModel();
+        } else {
+          setSmartSelectDownloadPopup(true);
+        }
+        return;
+      }
+      // ready — start accumulating stroke; onMouseUp will fire inference
+      samStrokeRef.current = [pos];
+      return;
+    }
+
     if (!al) return;
     const pc = pixelCanvases.current.get(al);
     if (!pc) return;
@@ -925,6 +1604,12 @@ export default function PaintEditor() {
     }
 
     const al = activeLayerRef.current;
+
+    if (t === 'smart-select') {
+      samStrokeRef.current.push(pos);
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
+    }
 
     if (t === 'crop' && startPos.current) {
       const x = Math.min(startPos.current.x, pos.x);
@@ -1050,6 +1735,64 @@ export default function PaintEditor() {
         dragHandle.current = null;
         renderAll(layersRef.current, objs, selectedIdRef.current);
       }
+      return;
+    }
+
+    if (t === 'smart-select') {
+      const stroke = samStrokeRef.current;
+      samStrokeRef.current = [];
+      console.log(`[SmartSelect mouseUp] stroke.length=${stroke.length}, activeLayer=${al}, mode=${useGrabCutRef.current ? 'GrabCut' : 'SAM'}, samStatus=${samStatusRef.current}`);
+      if (!al || stroke.length < 10) {
+        console.log('[SmartSelect mouseUp] aborted: no layer or stroke too short (need 10+ points)');
+        renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+        return;
+      }
+
+      if (useGrabCutRef.current) {
+        console.log('[SmartSelect mouseUp] running GrabCut...');
+        const result = runGrabCutSegment(stroke, al);
+        console.log('[SmartSelect mouseUp] GrabCut result:', result ? `${result.dw}x${result.dh}, ${result.data.filter(Boolean).length} true pixels` : 'null');
+        if (result) {
+          samMaskRef.current = result;
+          samClickLayerRef.current = al;
+          setSamActionPopup({ screenX: e.clientX, screenY: e.clientY });
+        }
+        renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+        return;
+      }
+
+      // SAM mode — build multiple interior positive points from the stroke
+      if (samStatusRef.current !== 'ready') {
+        console.log('[SmartSelect mouseUp] SAM not ready, status:', samStatusRef.current);
+        renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+        return;
+      }
+      const centroid = {
+        x: stroke.reduce((s, p) => s + p.x, 0) / stroke.length,
+        y: stroke.reduce((s, p) => s + p.y, 0) / stroke.length,
+      };
+      const xs = stroke.map((p) => p.x), ys = stroke.map((p) => p.y);
+      const strokeBbox: [number, number, number, number] = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+
+      // Sample ~16 evenly-spaced stroke points and create interior points
+      // at two depths: 25% inward (near edges — catches overhangs, details)
+      // and 50% inward (solidly inside — catches windows, colored parts).
+      const positivePoints: { x: number; y: number }[] = [centroid];
+      const sampleCount = Math.min(12, stroke.length);
+      const sampleStep = Math.max(1, Math.floor(stroke.length / sampleCount));
+      for (let i = 0; i < stroke.length; i += sampleStep) {
+        const p = stroke[i];
+        positivePoints.push({
+          x: p.x + (centroid.x - p.x) * 0.25,
+          y: p.y + (centroid.y - p.y) * 0.25,
+        });
+        positivePoints.push({
+          x: p.x + (centroid.x - p.x) * 0.5,
+          y: p.y + (centroid.y - p.y) * 0.5,
+        });
+      }
+      console.log(`[SmartSelect mouseUp] SAM centroid: (${centroid.x.toFixed(1)}, ${centroid.y.toFixed(1)}), bbox: [${strokeBbox.map(v => v.toFixed(1)).join(', ')}], positive points: ${positivePoints.length}`);
+      runSmartSelect(positivePoints, e.clientX, e.clientY, al, strokeBbox);
       return;
     }
 
@@ -1358,6 +2101,16 @@ export default function PaintEditor() {
     }
   }, [thumbPopup]);
 
+  // Auto-load SAM model if previously downloaded and user selects smart-select
+  useEffect(() => {
+    if (tool !== 'smart-select') return;
+    if (useGrabCutRef.current) return;
+    if (samStatusRef.current !== 'unloaded') return;
+    if (localStorage.getItem('paint_sam_ready') === '1') {
+      loadSamModel();
+    }
+  }, [tool]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
@@ -1438,6 +2191,7 @@ export default function PaintEditor() {
     { id: 'ellipse', label: 'Ellipse', icon: '\u25EF' },
     { id: 'text', label: 'Text', icon: 'T' },
     { id: 'crop', label: 'Crop', icon: '\u2702' },
+    { id: 'smart-select', label: 'Smart Select', icon: '\u2728' },
   ];
 
   const BLENDS: BlendMode[] = ['source-over', 'multiply', 'screen', 'overlay'];
@@ -1470,6 +2224,100 @@ export default function PaintEditor() {
         </div>
       )}
 
+      {/* SAM model download popup */}
+      {smartSelectDownloadPopup && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+          <div style={{ background: '#fff', border: '3px solid #000', padding: 24, boxShadow: '5px 5px 0 #000', fontFamily: 'Poppins, sans-serif', textAlign: 'center', maxWidth: 380 }}>
+            <p style={{ fontWeight: 700, fontSize: 16, marginBottom: 12, marginTop: 0 }}>{'\u2728'} Smart Select</p>
+            <p style={{ fontSize: 13, marginBottom: 8, color: '#333' }}>Requires a one-time model download (~90&nbsp;MB) which will be cached in your browser.</p>
+            <p style={{ fontSize: 12, marginBottom: 20, color: '#666' }}>Uses SAM ViT-Base (Segment Anything) running entirely in your browser — nothing is uploaded.</p>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+              <button
+                style={{ ...S.smallBtn('#000', '#fff'), padding: '8px 20px', fontSize: 13 }}
+                onClick={() => { setSmartSelectDownloadPopup(false); loadSamModel(); }}
+              >
+                Download &amp; Enable
+              </button>
+              <button
+                style={{ ...S.smallBtn(), padding: '8px 16px', fontSize: 13 }}
+                onClick={() => setSmartSelectDownloadPopup(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SAM action popup — shown after a mask is computed */}
+      {samActionPopup && (
+        <div style={{ position: 'fixed', top: samActionPopup.screenY + 12, left: samActionPopup.screenX + 12, zIndex: 9998, background: '#fff', border: '3px solid #000', boxShadow: '4px 4px 0 #000', padding: '12px 14px', fontFamily: 'Poppins, sans-serif' }}>
+          <p style={{ fontWeight: 700, fontSize: 12, margin: '0 0 8px' }}>Selection ready — what to do?</p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+            <button style={{ ...S.smallBtn('#c00', '#fff'), textAlign: 'left' }} onClick={smartSelectDelete}>
+              {'\uD83D\uDDD1\uFE0F'} Delete selection
+            </button>
+            <button style={{ ...S.smallBtn('#2563eb', '#fff'), textAlign: 'left' }} onClick={smartSelectToNewLayer}>
+              {'\u2B06\uFE0F'} Move to new layer
+            </button>
+            <button style={{ ...S.smallBtn('#166534', '#fff'), textAlign: 'left' }} onClick={smartSelectMakeObject}>
+              {'\uD83D\uDCE6'} Make moveable object
+            </button>
+            <button style={{ ...S.smallBtn(), textAlign: 'left' }} onClick={clearSamSelection}>
+              {'\u2715'} Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Settings popup */}
+      {settingsOpen && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}
+          onClick={() => setSettingsOpen(false)}
+        >
+          <div
+            style={{ background: '#fff', border: '3px solid #000', padding: 24, boxShadow: '5px 5px 0 #000', fontFamily: 'Poppins, sans-serif', minWidth: 320, maxWidth: 420 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+              <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 18 }}>{'\u2699\uFE0F'} Settings</strong>
+              <button style={S.smallBtn()} onClick={() => setSettingsOpen(false)}>{'\u2715'}</button>
+            </div>
+
+            <p style={{ ...S.label, marginBottom: 10 }}>SMART SELECT</p>
+
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', marginBottom: 14 }}>
+              <input
+                type='checkbox'
+                checked={useGrabCut}
+                onChange={(e) => {
+                  setUseGrabCut(e.target.checked);
+                  localStorage.setItem('paint_grabcut', e.target.checked ? '1' : '0');
+                }}
+                style={{ marginTop: 3, flexShrink: 0, width: 14, height: 14 }}
+              />
+              <span>
+                <span style={{ fontWeight: 700, fontSize: 12, display: 'block', marginBottom: 3 }}>Use color-based (GrabCut) instead of AI</span>
+                <span style={{ fontSize: 11, color: '#555', lineHeight: 1.5, display: 'block' }}>
+                  No model download needed. Works instantly but only reliably selects objects
+                  whose color differs clearly from the background. Best for colorful subjects
+                  against plain backgrounds.
+                </span>
+              </span>
+            </label>
+
+            <div style={{ marginTop: 4, opacity: useGrabCut ? 0.4 : 1 }}>
+              <span style={{ fontWeight: 700, fontSize: 12, display: 'block', marginBottom: 3 }}>Spatial constraint</span>
+              <span style={{ fontSize: 11, color: '#555', lineHeight: 1.5, display: 'block' }}>
+                The selection is always clipped to the bounding box of your painted stroke.
+                For best results, trace closely around the object you want to select.
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top bar */}
       <div style={{ border: '3px solid #000', background: '#fff', padding: '8px 12px', marginBottom: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', boxShadow: '4px 4px 0 #000' }}>
         <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 20 }}>{'\uD83C\uDFA8'} Paint</strong>
@@ -1479,6 +2327,7 @@ export default function PaintEditor() {
           <input type='file' accept='image/*' style={{ display: 'none' }} onChange={(e) => e.target.files?.[0] && importImage(e.target.files[0])} />
         </label>
         <button style={S.smallBtn()} onClick={exportPng}>{'\u2B07'} PNG</button>
+        <button style={S.smallBtn()} onClick={() => setSettingsOpen(true)} title='Settings'>{'\u2699\uFE0F'}</button>
         <span style={{ width: 1, background: '#000', height: 20, display: 'inline-block', margin: '0 4px' }} />
         <button style={S.smallBtn()} onClick={undo} title='Ctrl+Z'>{'\u21A9'} Undo</button>
         <button style={S.smallBtn()} onClick={redo} title='Ctrl+Y'>{'\u21AA'} Redo</button>
@@ -1528,6 +2377,25 @@ export default function PaintEditor() {
           ))}
 
           <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
+
+          {/* Smart Select status */}
+          {tool === 'smart-select' && (
+            <div style={{ fontSize: 11, fontFamily: 'Poppins, sans-serif', marginBottom: 6 }}>
+              {useGrabCut ? (
+                samActionPopup
+                  ? <p style={{ margin: 0, color: '#000', fontWeight: 700 }}>Selection active. Choose an action.</p>
+                  : <p style={{ margin: 0, color: '#166534' }}>Paint around the object (color-based). No AI needed.</p>
+              ) : (
+                <>
+                  {samStatus === 'unloaded' && <p style={{ margin: 0, color: '#666' }}>Paint over the edges of the object you want to select.</p>}
+                  {samStatus === 'downloading' && <p style={{ margin: 0, color: '#2563eb', fontWeight: 700 }}>Downloading AI model...</p>}
+                  {samStatus === 'ready' && !samActionPopup && <p style={{ margin: 0, color: '#166534' }}>Paint over the edges of the object to select it.</p>}
+                  {samStatus === 'inferring' && <p style={{ margin: 0, color: '#d97706', fontWeight: 700 }}>Analysing...</p>}
+                  {samActionPopup && <p style={{ margin: 0, color: '#000', fontWeight: 700 }}>Selection active. Choose an action.</p>}
+                </>
+              )}
+            </div>
+          )}
 
           {/* Contextual options -- selected object vs drawing */}
           {selObj ? (
@@ -1665,18 +2533,41 @@ export default function PaintEditor() {
               style={{ display: 'block', width: '100%', height: '100%', pointerEvents: 'none' }} />
             {/* Overlay (events, selection, preview) */}
             <canvas ref={overlayRef} width={docW} height={docH}
-              style={{ display: 'block', width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : 'crosshair' }}
+              style={{ display: 'block', width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : tool === 'smart-select' ? (samStatus === 'inferring' || samStatus === 'downloading' ? 'wait' : 'cell') : 'crosshair' }}
               onMouseDown={onMouseDown}
               onMouseMove={onMouseMove}
               onMouseUp={onMouseUp}
-              onMouseLeave={() => {
+              onMouseLeave={(e) => {
                 cursorPos.current = null;
+                // For smart-select, don't end stroke on leave — let user come back on
+                if (toolRef.current === 'smart-select' && drawing.current) {
+                  const rect = overlayRef.current!.getBoundingClientRect();
+                  const scaleX = docWRef.current / rect.width;
+                  const scaleY = docHRef.current / rect.height;
+                  const cx = Math.max(0, Math.min(docWRef.current, (e.clientX - rect.left) * scaleX));
+                  const cy = Math.max(0, Math.min(docHRef.current, (e.clientY - rect.top) * scaleY));
+                  samStrokeRef.current.push({ x: cx, y: cy });
+                  renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+                  return;
+                }
                 if (drawing.current) {
                   drawing.current = false;
                   dragMode.current = null;
                   renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
                 } else {
                   renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+                }
+              }}
+              onMouseEnter={(e) => {
+                // Resume smart-select stroke when mouse re-enters canvas
+                if (toolRef.current === 'smart-select' && samStrokeRef.current.length > 0 && (e.buttons & 1)) {
+                  drawing.current = true;
+                  const rect = overlayRef.current!.getBoundingClientRect();
+                  const scaleX = docWRef.current / rect.width;
+                  const scaleY = docHRef.current / rect.height;
+                  const cx = Math.max(0, Math.min(docWRef.current, (e.clientX - rect.left) * scaleX));
+                  const cy = Math.max(0, Math.min(docHRef.current, (e.clientY - rect.top) * scaleY));
+                  samStrokeRef.current.push({ x: cx, y: cy });
                 }
               }}
             />
