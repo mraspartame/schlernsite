@@ -2133,8 +2133,9 @@ async function runSmartSelect(
   const fitToContainer = useCallback(() => {
     if (canvasContainerRef.current) {
       const containerW = canvasContainerRef.current.clientWidth - 6;
-      const containerH = canvasContainerRef.current.clientHeight || 600;
-      const z = Math.min(1, containerW / docWRef.current, containerH / docHRef.current);
+      // Use the max available height (78vh), not clientHeight which shrinks with content
+      const containerH = window.innerHeight * 0.78;
+      const z = Math.min(containerW / docWRef.current, containerH / docHRef.current);
       setZoom(z);
       zoomRef.current = z;
     }
@@ -2476,9 +2477,23 @@ async function runSmartSelect(
         )}
         <span style={{ width: 1, background: '#000', height: 20, display: 'inline-block', margin: '0 4px' }} />
         {/* Zoom controls */}
-        <button style={S.smallBtn()} onClick={() => setZoom((z) => { const nz = Math.max(0.1, z - 0.1); zoomRef.current = nz; return nz; })} title='Zoom out'>{'\u2212'}</button>
+        <span
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 0 }}
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              setZoom((z) => { const nz = Math.min(4, +(z + 0.01).toFixed(2)); zoomRef.current = nz; return nz; });
+            } else if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              setZoom((z) => { const nz = Math.max(0.1, +(z - 0.01).toFixed(2)); zoomRef.current = nz; return nz; });
+            }
+          }}
+        >
+        <button style={S.smallBtn()} onClick={() => setZoom((z) => { const nz = Math.max(0.1, +(z - 0.05).toFixed(2)); zoomRef.current = nz; return nz; })} title='Zoom out'>{'\u2212'}</button>
         <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, minWidth: 40, textAlign: 'center' }}>{Math.round(zoom * 100)}%</span>
-        <button style={S.smallBtn()} onClick={() => setZoom((z) => { const nz = Math.min(4, z + 0.1); zoomRef.current = nz; return nz; })} title='Zoom in'>+</button>
+        <button style={S.smallBtn()} onClick={() => setZoom((z) => { const nz = Math.min(4, +(z + 0.05).toFixed(2)); zoomRef.current = nz; return nz; })} title='Zoom in'>+</button>
+        </span>
         <button style={S.smallBtn()} onClick={fitToContainer} title='Fit to view'>Fit</button>
         <button style={S.smallBtn()} onClick={() => { setZoom(1); zoomRef.current = 1; }} title='100%'>1:1</button>
         <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 10, color: '#666' }}>{docW}{'\u00D7'}{docH}</span>
