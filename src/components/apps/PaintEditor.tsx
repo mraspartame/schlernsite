@@ -155,7 +155,23 @@ function normBounds(o: PaintObj): PaintObj {
 function measureText(text: string, fontSize: number, fontFamily = 'Poppins, sans-serif'): { w: number; h: number } {
   const c = document.createElement('canvas').getContext('2d')!;
   c.font = `${fontSize}px ${fontFamily}`;
-  return { w: Math.ceil(c.measureText(text).width), h: Math.ceil(fontSize * 1.4) };
+  const lineH = Math.ceil(fontSize * 1.4);
+  const lines = (text || '').split('\n');
+  let maxW = 0;
+  for (const line of lines) maxW = Math.max(maxW, c.measureText(line).width);
+  return { w: Math.ceil(maxW), h: lineH * Math.max(1, lines.length) };
+}
+
+/** Get the x,y pixel offset of a cursor at position `pos` within multi-line text */
+function getTextCursorXY(text: string, pos: number, fontSize: number, fontFamily = 'Poppins, sans-serif'): { x: number; y: number } {
+  const c = document.createElement('canvas').getContext('2d')!;
+  c.font = `${fontSize}px ${fontFamily}`;
+  const lineH = Math.ceil(fontSize * 1.4);
+  const before = text.slice(0, pos);
+  const lines = before.split('\n');
+  const row = lines.length - 1;
+  const lastLine = lines[row];
+  return { x: c.measureText(lastLine).width, y: row * lineH };
 }
 
 // ── Rotation helpers ───────────────────────────────────────────────────────────
@@ -219,12 +235,18 @@ function drawObj(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<strin
       ctx.lineTo(o.x + o.w, o.y + o.h);
       ctx.stroke();
       break;
-    case 'text':
+    case 'text': {
       ctx.fillStyle = o.color ?? '#000';
-      ctx.font = `${o.fontSize ?? 24}px ${o.fontFamily ?? 'Poppins, sans-serif'}`;
+      const fSize = o.fontSize ?? 24;
+      ctx.font = `${fSize}px ${o.fontFamily ?? 'Poppins, sans-serif'}`;
       ctx.textBaseline = 'top';
-      ctx.fillText(o.text ?? '', o.x, o.y);
+      const lineH = Math.ceil(fSize * 1.4);
+      const textLines = (o.text ?? '').split('\n');
+      for (let li = 0; li < textLines.length; li++) {
+        ctx.fillText(textLines[li], o.x, o.y + li * lineH);
+      }
       break;
+    }
     case 'image': {
       const img = imgCache.get(o.src ?? '');
       if (img) ctx.drawImage(img, o.x, o.y, o.w, o.h);
@@ -387,9 +409,9 @@ export default function PaintEditor() {
   const [color, setColor] = useState('#000000');
   const [brushSize, setBrushSize] = useState(4);
   const [opacity, setOpacity] = useState(1);
-  const [textInput, setTextInput] = useState('Hello');
   const [fontSize, setFontSize] = useState(24);
   const [fontFamily, setFontFamily] = useState('Poppins, sans-serif');
+  const [editingTextId, setEditingTextId] = useState<string | null>(null);
   const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [snapRotation, setSnapRotation] = useState(true);
 
@@ -428,7 +450,8 @@ export default function PaintEditor() {
   const colorRef = useRef(color);             colorRef.current = color;
   const brushSizeRef = useRef(brushSize);     brushSizeRef.current = brushSize;
   const opacityRef = useRef(opacity);         opacityRef.current = opacity;
-  const textInputRef = useRef(textInput);     textInputRef.current = textInput;
+  const editingTextIdRef = useRef(editingTextId); editingTextIdRef.current = editingTextId;
+  const textCursorPosRef = useRef(0); // character index within the text being edited
   const fontSizeRef = useRef(fontSize);       fontSizeRef.current = fontSize;
   const fontFamilyRef = useRef(fontFamily);   fontFamilyRef.current = fontFamily;
   const activeLayerRef = useRef(activeLayerId); activeLayerRef.current = activeLayerId;
@@ -619,18 +642,43 @@ export default function PaintEditor() {
       overlay.restore();
     }
 
-    // Text cursor preview
-    if (toolRef.current === 'text' && cursorPos.current) {
+    // Text tool hover preview — show cursor line where text will be placed
+    if (toolRef.current === 'text' && cursorPos.current && !editingTextIdRef.current) {
       const { x, y } = cursorPos.current;
       const fSize = fontSizeRef.current;
-      const txt = textInputRef.current || 'Click to place text';
       overlay.save();
-      overlay.globalAlpha = 0.5;
-      overlay.fillStyle = colorRef.current;
-      overlay.font = `${fSize}px ${fontFamilyRef.current}`;
-      overlay.textBaseline = 'top';
-      overlay.fillText(txt, x, y);
+      overlay.strokeStyle = colorRef.current;
+      overlay.lineWidth = 1.5;
+      overlay.globalAlpha = 0.7;
+      overlay.beginPath();
+      overlay.moveTo(x, y);
+      overlay.lineTo(x, y + fSize * 1.2);
+      overlay.stroke();
       overlay.restore();
+    }
+
+    // Blinking cursor for inline text editing
+    if (editingTextIdRef.current) {
+      const editObj = currentObjects.find((o) => o.id === editingTextIdRef.current);
+      if (editObj && editObj.type === 'text') {
+        const blink = Math.floor(Date.now() / 500) % 2 === 0;
+        if (blink) {
+          const fSize = editObj.fontSize ?? 24;
+          const ff = editObj.fontFamily ?? 'Poppins, sans-serif';
+          const txt = editObj.text ?? '';
+          const cp = Math.min(textCursorPosRef.current, txt.length);
+          const cur = getTextCursorXY(txt, cp, fSize, ff);
+          const lineH = Math.ceil(fSize * 1.2);
+          overlay.save();
+          overlay.strokeStyle = editObj.color ?? '#000';
+          overlay.lineWidth = 1.5;
+          overlay.beginPath();
+          overlay.moveTo(editObj.x + cur.x, editObj.y + cur.y);
+          overlay.lineTo(editObj.x + cur.x, editObj.y + cur.y + lineH);
+          overlay.stroke();
+          overlay.restore();
+        }
+      }
     }
 
     // Crop rect overlay
@@ -1524,6 +1572,11 @@ async function runSmartSelect(
     startPos.current = pos;
     lastPos.current = pos;
 
+    // Finish inline text editing if clicking with a non-text tool
+    if (editingTextIdRef.current && t !== 'text') {
+      finishTextEditing();
+    }
+
     // Mask modification mode — paint or erase mask pixels
     if (modifyingMaskRef.current && samMaskRef.current) {
       const erase = e.altKey || e.button === 2;
@@ -1625,25 +1678,30 @@ async function runSmartSelect(
     }
 
     if (t === 'text') {
+      // If already editing a text object, finish it first
+      if (editingTextIdRef.current) {
+        finishTextEditing();
+      }
       const fSize = fontSizeRef.current;
       const ff = fontFamilyRef.current;
-      const txt = textInputRef.current || 'Text';
-      const dims = measureText(txt, fSize, ff);
+      const dims = measureText('|', fSize, ff); // minimal width for empty text
       saveHistory();
+      const newId = uid();
       const newObj: PaintObj = {
-        id: uid(), layerId: al, type: 'text',
+        id: newId, layerId: al, type: 'text',
         x: pos.x, y: pos.y, w: dims.w, h: dims.h,
         opacity: opacityRef.current,
-        text: txt, fontSize: fSize, fontFamily: ff, color: colorRef.current,
+        text: '', fontSize: fSize, fontFamily: ff, color: colorRef.current,
       };
       const next = [...objectsRef.current, newObj];
       objectsRef.current = next;
       setObjects(next);
-      setSelectedId(newObj.id);
-      selectedIdRef.current = newObj.id;
-      setTool('select');
-      toolRef.current = 'select';
-      renderAll(layersRef.current, next, newObj.id);
+      setSelectedId(newId);
+      selectedIdRef.current = newId;
+      setEditingTextId(newId);
+      editingTextIdRef.current = newId;
+      textCursorPosRef.current = 0;
+      renderAll(layersRef.current, next, newId);
       drawing.current = false;
       return;
     }
@@ -2018,6 +2076,39 @@ async function runSmartSelect(
     renderAll(layersRef.current, objs, id);
   }, [renderAll]);
 
+  /** Finish inline text editing — remove the object if text is empty */
+  function finishTextEditing() {
+    const eid = editingTextIdRef.current;
+    if (!eid) return;
+    setEditingTextId(null);
+    editingTextIdRef.current = null;
+    // If text is empty, remove the object
+    const obj = objectsRef.current.find((o) => o.id === eid);
+    if (obj && (!obj.text || obj.text.trim() === '')) {
+      const next = objectsRef.current.filter((o) => o.id !== eid);
+      objectsRef.current = next;
+      setObjects(next);
+      if (selectedIdRef.current === eid) {
+        setSelectedId(null);
+        selectedIdRef.current = null;
+      }
+      renderAll(layersRef.current, next, selectedIdRef.current);
+    } else {
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+    }
+  }
+
+  /** Start editing an existing text object inline */
+  function startTextEditing(objId: string) {
+    const obj = objectsRef.current.find((o) => o.id === objId);
+    setEditingTextId(objId);
+    editingTextIdRef.current = objId;
+    textCursorPosRef.current = (obj?.text ?? '').length;
+    setSelectedId(objId);
+    selectedIdRef.current = objId;
+    renderAll(layersRef.current, objectsRef.current, objId);
+  }
+
   // ── Import image as object ─────────────────────────────────────────────────
 
   const addImageToLayer = useCallback((src: string, layerId: string) => {
@@ -2210,6 +2301,15 @@ async function runSmartSelect(
     renderAll(layers, objects, selectedId);
   }, [layers, objects, selectedId, docW, docH, renderAll]);
 
+  // Blink timer for inline text editing cursor
+  useEffect(() => {
+    if (!editingTextId) return;
+    const id = setInterval(() => {
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+    }, 500);
+    return () => clearInterval(id);
+  }, [editingTextId, renderAll]);
+
   // Render popup preview after the popup canvas is mounted
   useEffect(() => {
     if (thumbPopup) {
@@ -2229,7 +2329,109 @@ async function runSmartSelect(
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
+      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA' || (e.target as HTMLElement).tagName === 'SELECT') return;
+
+      // Inline text editing — route keys to the editing text object
+      if (editingTextIdRef.current) {
+        const eid = editingTextIdRef.current;
+        const obj = objectsRef.current.find((o) => o.id === eid);
+        if (!obj) return;
+        const oldTxt = obj.text ?? '';
+        const cp = textCursorPosRef.current;
+
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          finishTextEditing();
+          return;
+        }
+        if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); return; }
+        if ((e.ctrlKey || e.metaKey) && e.key === 'y') { e.preventDefault(); redo(); return; }
+
+        // Arrow keys — move cursor
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          textCursorPosRef.current = Math.max(0, cp - 1);
+          renderAll(layersRef.current, objectsRef.current, eid);
+          return;
+        }
+        if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          textCursorPosRef.current = Math.min(oldTxt.length, cp + 1);
+          renderAll(layersRef.current, objectsRef.current, eid);
+          return;
+        }
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          // Find current line and column
+          const before = oldTxt.slice(0, cp);
+          const lines = oldTxt.split('\n');
+          const beforeLines = before.split('\n');
+          const curLine = beforeLines.length - 1;
+          const curCol = beforeLines[curLine].length;
+          const targetLine = e.key === 'ArrowUp' ? curLine - 1 : curLine + 1;
+          if (targetLine < 0 || targetLine >= lines.length) return;
+          const targetCol = Math.min(curCol, lines[targetLine].length);
+          // Compute new absolute position
+          let newPos = 0;
+          for (let i = 0; i < targetLine; i++) newPos += lines[i].length + 1; // +1 for \n
+          newPos += targetCol;
+          textCursorPosRef.current = newPos;
+          renderAll(layersRef.current, objectsRef.current, eid);
+          return;
+        }
+        if (e.key === 'Home') {
+          e.preventDefault();
+          // Move to start of current line
+          const before = oldTxt.slice(0, cp);
+          const lastNewline = before.lastIndexOf('\n');
+          textCursorPosRef.current = lastNewline + 1;
+          renderAll(layersRef.current, objectsRef.current, eid);
+          return;
+        }
+        if (e.key === 'End') {
+          e.preventDefault();
+          // Move to end of current line
+          const nextNewline = oldTxt.indexOf('\n', cp);
+          textCursorPosRef.current = nextNewline === -1 ? oldTxt.length : nextNewline;
+          renderAll(layersRef.current, objectsRef.current, eid);
+          return;
+        }
+
+        // Helper to update text and cursor
+        const updateText = (newTxt: string, newCp: number) => {
+          const dims = measureText(newTxt || '|', obj.fontSize ?? 24, obj.fontFamily);
+          const objs = objectsRef.current.map((o) => o.id === eid ? { ...o, text: newTxt, w: dims.w, h: dims.h } : o);
+          objectsRef.current = objs;
+          setObjects(objs);
+          textCursorPosRef.current = newCp;
+          renderAll(layersRef.current, objs, eid);
+        };
+
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          updateText(oldTxt.slice(0, cp) + '\n' + oldTxt.slice(cp), cp + 1);
+          return;
+        }
+        if (e.key === 'Backspace') {
+          e.preventDefault();
+          if (cp === 0) return;
+          updateText(oldTxt.slice(0, cp - 1) + oldTxt.slice(cp), cp - 1);
+          return;
+        }
+        if (e.key === 'Delete') {
+          e.preventDefault();
+          if (cp >= oldTxt.length) return;
+          updateText(oldTxt.slice(0, cp) + oldTxt.slice(cp + 1), cp);
+          return;
+        }
+        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          updateText(oldTxt.slice(0, cp) + e.key + oldTxt.slice(cp), cp + 1);
+          return;
+        }
+        return;
+      }
+
       if (e.key === 'Delete' || e.key === 'Backspace') deleteSelected();
       if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); }
       if ((e.ctrlKey || e.metaKey) && e.key === 'y') { e.preventDefault(); redo(); }
@@ -2534,7 +2736,9 @@ async function runSmartSelect(
           <p style={{ ...S.label, marginBottom: 6 }}>TOOLS</p>
           {TOOLS.map((t) => (
             <button key={t.id} style={S.toolBtn(tool === t.id)} onClick={() => {
+              if (editingTextIdRef.current) finishTextEditing();
               setTool(t.id);
+              toolRef.current = t.id;
               if (t.id !== 'text') cursorPos.current = null;
               renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
             }}>
@@ -2584,12 +2788,6 @@ async function runSmartSelect(
 
               {selObj.type === 'text' && (
                 <>
-                  <label style={S.label}>Text</label>
-                  <input style={S.input} value={selObj.text ?? ''}
-                    onChange={(e) => {
-                      const dims = measureText(e.target.value, selObj.fontSize ?? 24, selObj.fontFamily);
-                      updateSelectedObj({ text: e.target.value, w: dims.w, h: dims.h });
-                    }} />
                   <label style={S.label}>Font</label>
                   <select value={selObj.fontFamily ?? 'Poppins, sans-serif'}
                     onChange={(e) => {
@@ -2668,8 +2866,7 @@ async function runSmartSelect(
               {tool === 'text' && (
                 <>
                   <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
-                  <label style={S.label}>Text to place</label>
-                  <input style={S.input} value={textInput} onChange={(e) => setTextInput(e.target.value)} placeholder='Enter text...' />
+                  <p style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, color: '#555', margin: '0 0 6px' }}>Click on the canvas to place text, then type.</p>
                   <label style={S.label}>Font</label>
                   <select value={fontFamily} onChange={(e) => setFontFamily(e.target.value)}
                     style={{ width: '100%', border: '1px solid #000', padding: '3px 4px', fontFamily: 'Poppins, sans-serif', fontSize: 11, marginBottom: 4 }}>
@@ -2679,12 +2876,6 @@ async function runSmartSelect(
                   <input type='range' min={8} max={200} value={fontSize}
                     onChange={(e) => setFontSize(parseInt(e.target.value))}
                     style={{ width: '100%', marginBottom: 6 }} />
-                  {/* Live font preview */}
-                  <div style={{ border: '1px dashed #999', padding: 6, background: '#fafafa', minHeight: 40, overflow: 'hidden' }}>
-                    <span style={{ fontFamily, fontSize: Math.min(fontSize, 48), color, lineHeight: 1.2, display: 'block', whiteSpace: 'pre' }}>
-                      {textInput || 'Preview'}
-                    </span>
-                  </div>
                 </>
               )}
             </>
@@ -2702,6 +2893,15 @@ async function runSmartSelect(
             <canvas ref={overlayRef} width={docW} height={docH}
               style={{ display: 'block', width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, cursor: modifyingMask ? 'none' : tool === 'text' ? 'text' : tool === 'select' ? 'default' : tool === 'smart-select' ? (samStatus === 'inferring' || samStatus === 'downloading' ? 'wait' : 'cell') : 'crosshair' }}
               onMouseDown={onMouseDown}
+              onDoubleClick={(e) => {
+                if (toolRef.current !== 'select') return;
+                const pos = getPos(e);
+                const hit = [...objectsRef.current].reverse().find((o) => o.type === 'text' && hitTest(o, pos.x, pos.y));
+                if (hit) {
+                  e.preventDefault();
+                  startTextEditing(hit.id);
+                }
+              }}
               onMouseMove={onMouseMove}
               onMouseUp={onMouseUp}
               onContextMenu={(e) => { if (modifyingMaskRef.current) e.preventDefault(); }}
