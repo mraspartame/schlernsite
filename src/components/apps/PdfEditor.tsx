@@ -133,7 +133,6 @@ export default function PdfEditor() {
   const [tool, setTool] = useState<'select' | 'rect' | 'text' | 'image'>('select');
   const [annColor, setAnnColor] = useState('#000000');
   const [annFont, setAnnFont] = useState('Poppins, sans-serif');
-  const [textInput, setTextInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadProgress, setLoadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -159,7 +158,6 @@ export default function PdfEditor() {
   const toolRef = useRef(tool);                 toolRef.current = tool;
   const colorRef = useRef(annColor);            colorRef.current = annColor;
   const annFontRef = useRef(annFont);           annFontRef.current = annFont;
-  const textInputRef = useRef(textInput);       textInputRef.current = textInput;
   const activePageRef = useRef(activePage);     activePageRef.current = activePage;
 
   const [snapRotation, setSnapRotation] = useState(true);
@@ -171,6 +169,9 @@ export default function PdfEditor() {
   const [sigDismissed, setSigDismissed] = useState(false);
   const [fullPage, setFullPage] = useState(() => localStorage.getItem('pdf_fullpage') === '1');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [editingAnnId, setEditingAnnId] = useState<string | null>(null);
+  const editingAnnIdRef = useRef<string | null>(null); editingAnnIdRef.current = editingAnnId;
+  const annCursorPosRef = useRef(0);
   const sigPeerRef = useRef<any>(null);
 
   // Interaction state
@@ -226,6 +227,57 @@ export default function PdfEditor() {
     prevPagesLenRef.current = pages.length;
   }, [pages.length, fitToWidth]);
 
+  // ── Text annotation helpers ────────────────────────────────────────────────
+
+  const ANN_FONT_SIZE = 16;
+
+  function measureAnnText(text: string, fontFamily = 'Poppins, sans-serif'): { w: number; h: number } {
+    const c = document.createElement('canvas').getContext('2d')!;
+    c.font = `bold ${ANN_FONT_SIZE}px ${fontFamily}`;
+    const lineH = Math.ceil(ANN_FONT_SIZE * 1.4);
+    const lines = (text || '').split('\n');
+    let maxW = 0;
+    for (const line of lines) maxW = Math.max(maxW, c.measureText(line).width);
+    return { w: Math.ceil(maxW) || 10, h: lineH * Math.max(1, lines.length) };
+  }
+
+  function getAnnCursorXY(text: string, pos: number, fontFamily = 'Poppins, sans-serif'): { x: number; y: number } {
+    const c = document.createElement('canvas').getContext('2d')!;
+    c.font = `bold ${ANN_FONT_SIZE}px ${fontFamily}`;
+    const lineH = Math.ceil(ANN_FONT_SIZE * 1.4);
+    const before = text.slice(0, pos);
+    const lines = before.split('\n');
+    const row = lines.length - 1;
+    return { x: c.measureText(lines[row]).width, y: row * lineH };
+  }
+
+  function finishAnnEditing() {
+    const eid = editingAnnIdRef.current;
+    if (!eid) return;
+    setEditingAnnId(null);
+    editingAnnIdRef.current = null;
+    // Remove empty text annotations
+    const ann = annotationsRef.current.find((a) => a.id === eid);
+    if (ann && (!ann.text || ann.text.trim() === '')) {
+      const next = annotationsRef.current.filter((a) => a.id !== eid);
+      annotationsRef.current = next;
+      setAnnotations(next);
+      if (selectedAnnRef.current === eid) {
+        setSelectedAnnId(null);
+        selectedAnnRef.current = null;
+      }
+    }
+  }
+
+  function startAnnEditing(annId: string) {
+    const ann = annotationsRef.current.find((a) => a.id === annId);
+    setEditingAnnId(annId);
+    editingAnnIdRef.current = annId;
+    annCursorPosRef.current = (ann?.text ?? '').length;
+    setSelectedAnnId(annId);
+    selectedAnnRef.current = annId;
+  }
+
   // ── Per-page overlay drawing ───────────────────────────────────────────────
 
   const redrawPageOverlay = useCallback((pageId: string) => {
@@ -257,13 +309,39 @@ export default function PdfEditor() {
         ctx.strokeStyle = ann.color;
         ctx.lineWidth = 2;
         ctx.strokeRect(ann.x, ann.y, ann.w, ann.h);
-      } else if (ann.type === 'text' && ann.text) {
+      } else if (ann.type === 'text') {
         const ff = ann.fontFamily ?? 'Poppins, sans-serif';
-        ctx.font = `bold 16px ${ff}`;
-        ctx.fillStyle = '#fff';
-        ctx.fillText(ann.text, ann.x + 1, ann.y + 1);
-        ctx.fillStyle = ann.color;
-        ctx.fillText(ann.text, ann.x, ann.y);
+        ctx.font = `bold ${ANN_FONT_SIZE}px ${ff}`;
+        ctx.textBaseline = 'top';
+        const lineH = Math.ceil(ANN_FONT_SIZE * 1.4);
+        const textLines = (ann.text ?? '').split('\n');
+        for (let li = 0; li < textLines.length; li++) {
+          ctx.fillStyle = '#fff';
+          ctx.fillText(textLines[li], ann.x + 1, ann.y + li * lineH + 1);
+          ctx.fillStyle = ann.color;
+          ctx.fillText(textLines[li], ann.x, ann.y + li * lineH);
+        }
+        // Draw empty text placeholder when editing
+        if (editingAnnIdRef.current === ann.id && !ann.text) {
+          ctx.fillStyle = '#aaa';
+          ctx.fillText('Type here…', ann.x, ann.y);
+        }
+        // Blinking cursor
+        if (editingAnnIdRef.current === ann.id) {
+          const blink = Math.floor(Date.now() / 500) % 2 === 0;
+          if (blink) {
+            const txt = ann.text ?? '';
+            const cp = Math.min(annCursorPosRef.current, txt.length);
+            const cur = getAnnCursorXY(txt, cp, ff);
+            const curLineH = Math.ceil(ANN_FONT_SIZE * 1.2);
+            ctx.strokeStyle = ann.color;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(ann.x + cur.x, ann.y + cur.y);
+            ctx.lineTo(ann.x + cur.x, ann.y + cur.y + curLineH);
+            ctx.stroke();
+          }
+        }
       } else if (ann.type === 'image' && ann.imageSrc) {
         const img = imageCache.current.get(ann.imageSrc);
         if (img) {
@@ -381,6 +459,17 @@ export default function PdfEditor() {
       redrawPageOverlay(pageId);
     }
   }, [annotations, selectedAnnId, redrawPageOverlay]);
+
+  // Blink timer for inline text editing cursor
+  useEffect(() => {
+    if (!editingAnnId) return;
+    const id = setInterval(() => {
+      for (const pageId of pageOverlayRefs.current.keys()) {
+        redrawPageOverlay(pageId);
+      }
+    }, 500);
+    return () => clearInterval(id);
+  }, [editingAnnId, redrawPageOverlay]);
 
   // Re-render pages when page list or zoom changes
   useEffect(() => {
@@ -500,19 +589,28 @@ export default function PdfEditor() {
     const t = toolRef.current;
     const ia = interactRef.current;
 
+    // Finish inline text editing if clicking with a non-text tool
+    if (editingAnnIdRef.current && t !== 'text') {
+      finishAnnEditing();
+    }
+
     if (t === 'text') {
-      const txt = textInputRef.current || prompt('Enter annotation text:', '') || '';
-      if (!txt) return;
+      if (editingAnnIdRef.current) finishAnnEditing();
+      const dims = measureAnnText('', annFontRef.current);
+      const newId = uid();
       const newAnn: Annotation = {
-        id: uid(), pageId, type: 'text',
-        x: pos.x, y: pos.y, w: txt.length * 9, h: 20,
-        color: colorRef.current, text: txt, fontFamily: annFontRef.current,
+        id: newId, pageId, type: 'text',
+        x: pos.x, y: pos.y, w: dims.w, h: dims.h,
+        color: colorRef.current, text: '', fontFamily: annFontRef.current,
       };
       const next = [...annotationsRef.current, newAnn];
       annotationsRef.current = next;
       setAnnotations(next);
-      setSelectedAnnId(newAnn.id);
-      setTool('select');
+      setSelectedAnnId(newId);
+      selectedAnnRef.current = newId;
+      setEditingAnnId(newId);
+      editingAnnIdRef.current = newId;
+      annCursorPosRef.current = 0;
       return;
     }
 
@@ -887,9 +985,15 @@ export default function PdfEditor() {
             ctx.strokeStyle = ann.color; ctx.lineWidth = 2;
             ctx.strokeRect(ann.x * scaleX, ann.y * scaleY, ann.w * scaleX, ann.h * scaleY);
           } else if (ann.type === 'text' && ann.text) {
-            ctx.font = `bold ${16 * SCALE}px ${ann.fontFamily ?? 'sans-serif'}`;
+            const saveFontSize = 16 * SCALE;
+            ctx.font = `bold ${saveFontSize}px ${ann.fontFamily ?? 'sans-serif'}`;
+            ctx.textBaseline = 'top';
             ctx.fillStyle = ann.color;
-            ctx.fillText(ann.text, ann.x * scaleX, ann.y * scaleY);
+            const saveLineH = Math.ceil(saveFontSize * 1.4);
+            const saveLines = ann.text.split('\n');
+            for (let li = 0; li < saveLines.length; li++) {
+              ctx.fillText(saveLines[li], ann.x * scaleX, ann.y * scaleY + li * saveLineH);
+            }
           } else if (ann.type === 'image' && ann.imageSrc) {
             const img = imageCache.current.get(ann.imageSrc);
             if (img) {
@@ -935,13 +1039,60 @@ export default function PdfEditor() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).tagName === 'INPUT') return;
+      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA' || (e.target as HTMLElement).tagName === 'SELECT') return;
+
+      // Inline text editing
+      if (editingAnnIdRef.current) {
+        const eid = editingAnnIdRef.current;
+        const ann = annotationsRef.current.find((a) => a.id === eid);
+        if (!ann) return;
+        const oldTxt = ann.text ?? '';
+        const cp = annCursorPosRef.current;
+
+        if (e.key === 'Escape') { e.preventDefault(); finishAnnEditing(); return; }
+
+        if (e.key === 'ArrowLeft') { e.preventDefault(); annCursorPosRef.current = Math.max(0, cp - 1); return; }
+        if (e.key === 'ArrowRight') { e.preventDefault(); annCursorPosRef.current = Math.min(oldTxt.length, cp + 1); return; }
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          const before = oldTxt.slice(0, cp);
+          const lines = oldTxt.split('\n');
+          const beforeLines = before.split('\n');
+          const curLine = beforeLines.length - 1;
+          const curCol = beforeLines[curLine].length;
+          const targetLine = e.key === 'ArrowUp' ? curLine - 1 : curLine + 1;
+          if (targetLine < 0 || targetLine >= lines.length) return;
+          const targetCol = Math.min(curCol, lines[targetLine].length);
+          let newPos = 0;
+          for (let i = 0; i < targetLine; i++) newPos += lines[i].length + 1;
+          newPos += targetCol;
+          annCursorPosRef.current = newPos;
+          return;
+        }
+        if (e.key === 'Home') { e.preventDefault(); const ln = oldTxt.slice(0, cp).lastIndexOf('\n'); annCursorPosRef.current = ln + 1; return; }
+        if (e.key === 'End') { e.preventDefault(); const nl = oldTxt.indexOf('\n', cp); annCursorPosRef.current = nl === -1 ? oldTxt.length : nl; return; }
+
+        const updateAnnText = (newTxt: string, newCp: number) => {
+          const dims = measureAnnText(newTxt, ann.fontFamily);
+          const next = annotationsRef.current.map((a) => a.id === eid ? { ...a, text: newTxt, w: dims.w, h: dims.h } : a);
+          annotationsRef.current = next;
+          setAnnotations(next);
+          annCursorPosRef.current = newCp;
+        };
+
+        if (e.key === 'Enter') { e.preventDefault(); updateAnnText(oldTxt.slice(0, cp) + '\n' + oldTxt.slice(cp), cp + 1); return; }
+        if (e.key === 'Backspace') { e.preventDefault(); if (cp === 0) return; updateAnnText(oldTxt.slice(0, cp - 1) + oldTxt.slice(cp), cp - 1); return; }
+        if (e.key === 'Delete') { e.preventDefault(); if (cp >= oldTxt.length) return; updateAnnText(oldTxt.slice(0, cp) + oldTxt.slice(cp + 1), cp); return; }
+        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) { e.preventDefault(); updateAnnText(oldTxt.slice(0, cp) + e.key + oldTxt.slice(cp), cp + 1); return; }
+        return;
+      }
+
       if (e.key === 'Delete' || e.key === 'Backspace') deleteSelectedAnnotation();
       if (e.key === 'Escape') { setSelectedAnnId(null); selectedAnnRef.current = null; }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selectedAnnId]);
+  }, [selectedAnnId, editingAnnId]);
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -1080,7 +1231,7 @@ export default function PdfEditor() {
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                   <span style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 12 }}>Tool:</span>
                   {(['select', 'rect', 'text', 'image'] as const).map((t) => (
-                    <button key={t} style={S.btn(tool === t ? '#000' : '#fff', tool === t ? '#fff' : '#000')} onClick={() => setTool(t)}>
+                    <button key={t} style={S.btn(tool === t ? '#000' : '#fff', tool === t ? '#fff' : '#000')} onClick={() => { if (editingAnnIdRef.current) finishAnnEditing(); setTool(t); toolRef.current = t; }}>
                       {t === 'select' ? '↖ Select' : t === 'rect' ? '▭ Highlight' : t === 'text' ? 'T Text' : '🖼 Image'}
                     </button>
                   ))}
@@ -1091,15 +1242,10 @@ export default function PdfEditor() {
                       style={{ width: 22, height: 22, background: c, border: annColor === c ? '3px solid #0088ff' : '2px solid #ccc', cursor: 'pointer', padding: 0, boxSizing: 'border-box' as const }} />
                   ))}
                   {tool === 'text' && (
-                    <>
-                      <input value={textInput} onChange={(e) => setTextInput(e.target.value)}
-                        placeholder='Text to add…'
-                        style={{ border: '2px solid #000', padding: '4px 8px', fontSize: 12, fontFamily: 'Poppins, sans-serif' }} />
-                      <select value={annFont} onChange={(e) => setAnnFont(e.target.value)}
-                        style={{ border: '2px solid #000', padding: '4px 6px', fontSize: 12, fontFamily: 'Poppins, sans-serif', cursor: 'pointer' }}>
-                        {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
-                      </select>
-                    </>
+                    <select value={annFont} onChange={(e) => setAnnFont(e.target.value)}
+                      style={{ border: '2px solid #000', padding: '4px 6px', fontSize: 12, fontFamily: 'Poppins, sans-serif', cursor: 'pointer' }}>
+                      {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                    </select>
                   )}
                   {tool === 'image' && (
                     <label style={{ ...S.btn('#fff', '#000'), cursor: 'pointer' }}>
@@ -1148,6 +1294,13 @@ export default function PdfEditor() {
                         ref={(el) => { if (el) pageOverlayRefs.current.set(p.id, el); else pageOverlayRefs.current.delete(p.id); }}
                         style={overlayStyle(p.id)}
                         onMouseDown={(e) => onOverlayDown(e, p.id)}
+                        onDoubleClick={(e) => {
+                          if (toolRef.current !== 'select') return;
+                          const pos = getOverlayPos(e);
+                          const pageAnns = annotationsRef.current.filter((a) => a.pageId === p.id);
+                          const hit = [...pageAnns].reverse().find((a) => a.type === 'text' && annHitTest(a, pos.x, pos.y));
+                          if (hit) { e.preventDefault(); startAnnEditing(hit.id); }
+                        }}
                       />
                     </div>
                   ))}
@@ -1214,11 +1367,6 @@ export default function PdfEditor() {
                   )}
                   {selAnn.type === 'text' && (
                     <>
-                      <label style={S.label}>Text</label>
-                      <input value={selAnn.text ?? ''}
-                        onChange={(e) => updateSelAnn({ text: e.target.value, w: e.target.value.length * 9 })}
-                        style={{ border: '1px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8 }}
-                      />
                       <label style={S.label}>Font</label>
                       <select value={selAnn.fontFamily ?? 'Poppins, sans-serif'}
                         onChange={(e) => updateSelAnn({ fontFamily: e.target.value })}
