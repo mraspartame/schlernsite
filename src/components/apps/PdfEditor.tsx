@@ -169,6 +169,8 @@ export default function PdfEditor() {
   const [sigState, setSigState] = useState<'idle' | 'waiting' | 'received' | 'error'>('idle');
   const [sigUrl, setSigUrl] = useState('');
   const [sigDismissed, setSigDismissed] = useState(false);
+  const [fullPage, setFullPage] = useState(() => localStorage.getItem('pdf_fullpage') === '1');
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const sigPeerRef = useRef<any>(null);
 
   // Interaction state
@@ -950,11 +952,11 @@ export default function PdfEditor() {
   });
 
   return (
-    <div style={{ maxWidth: 1400, margin: '0 auto' }}>
+    <div style={fullPage ? { position: 'fixed', inset: 0, zIndex: 9000, background: '#fff', display: 'flex', flexDirection: 'column', overflow: 'hidden' } : { maxWidth: 1400, margin: '0 auto' }}>
 
       {/* ── Signature session banner ── */}
       {sigState === 'waiting' && sigUrl && !sigDismissed && (
-        <div style={{ border: '3px solid #000', background: '#fffde7', padding: '14px 16px', marginBottom: 12, boxShadow: '5px 5px 0 #000', display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+        <div style={{ border: '3px solid #000', background: '#fffde7', padding: '14px 16px', marginBottom: fullPage ? 0 : 12, boxShadow: fullPage ? 'none' : '5px 5px 0 #000', display: 'flex', gap: 12, alignItems: 'flex-start', flexShrink: 0 }}>
           <div style={{ flex: 1 }}>
             <p style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
               ✍ Open this link on your phone or tablet to draw your signature:
@@ -974,13 +976,53 @@ export default function PdfEditor() {
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '190px minmax(0, 1fr) 210px', gap: 12, alignItems: 'start' }}>
+      {/* Settings popup */}
+      {settingsOpen && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}
+          onClick={() => setSettingsOpen(false)}
+        >
+          <div
+            style={{ background: '#fff', border: '3px solid #000', padding: 24, boxShadow: '5px 5px 0 #000', fontFamily: 'Poppins, sans-serif', minWidth: 320, maxWidth: 420 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+              <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 18 }}>{'\u2699\uFE0F'} Settings</strong>
+              <button style={S.btn('#fff', '#000')} onClick={() => setSettingsOpen(false)}>{'\u2715'}</button>
+            </div>
+
+            <p style={{ ...S.label, marginBottom: 10 }}>DISPLAY</p>
+
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+              <input
+                type='checkbox'
+                checked={fullPage}
+                onChange={(e) => {
+                  setFullPage(e.target.checked);
+                  localStorage.setItem('pdf_fullpage', e.target.checked ? '1' : '0');
+                  setSettingsOpen(false);
+                  requestAnimationFrame(() => requestAnimationFrame(fitToWidth));
+                }}
+                style={{ marginTop: 3, flexShrink: 0, width: 14, height: 14 }}
+              />
+              <span>
+                <span style={{ fontWeight: 700, fontSize: 12, display: 'block', marginBottom: 3 }}>Full page mode</span>
+                <span style={{ fontSize: 11, color: '#555', lineHeight: 1.5, display: 'block' }}>
+                  Hides the site header and expands the editor to fill the entire browser window.
+                </span>
+              </span>
+            </label>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: '190px minmax(0, 1fr) 210px', gap: fullPage ? 0 : 12, alignItems: 'start', ...(fullPage ? { flex: 1, overflow: 'hidden' } : {}) }}>
 
         {/* ── Page list sidebar ── */}
         {pages.length > 0 ? (
-          <div style={{ ...S.card, padding: 10 }}>
+          <div style={{ ...S.card, padding: 10, ...(fullPage ? { border: 'none', borderRight: '2px solid #000', boxShadow: 'none', marginBottom: 0, height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' } : {}) }}>
             <h2 style={S.h2}>Pages ({pages.length})</h2>
-            <div style={{ maxHeight: '80vh', overflowY: 'auto' }}>
+            <div style={{ maxHeight: fullPage ? undefined : '80vh', overflowY: 'auto', ...(fullPage ? { flex: 1 } : {}) }}>
               {pages.map((p, idx) => (
                 <div key={p.id}
                   onClick={() => { setActivePage(p.id); scrollToPage(p.id); }}
@@ -1006,7 +1048,7 @@ export default function PdfEditor() {
         ) : <div />}
 
         {/* ── Main canvas area ── */}
-        <div style={{ minWidth: 0 }}>
+        <div style={{ minWidth: 0, ...(fullPage ? { height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' } : {}) }}>
           {pages.length === 0 ? (
             <div style={{ border: '3px solid #000', background: '#888', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 500, boxShadow: '5px 5px 0 #000' }}>
               {loading ? (
@@ -1020,7 +1062,7 @@ export default function PdfEditor() {
           ) : (
             <>
               {/* Annotation toolbar */}
-              <div style={{ ...S.card, padding: 10, marginBottom: 8 }}>
+              <div style={{ ...S.card, padding: 10, marginBottom: fullPage ? 0 : 8, ...(fullPage ? { border: 'none', borderBottom: '2px solid #000', boxShadow: 'none', flexShrink: 0 } : {}) }}>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                   <span style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 12 }}>Tool:</span>
                   {(['select', 'rect', 'text', 'image'] as const).map((t) => (
@@ -1052,13 +1094,13 @@ export default function PdfEditor() {
                         onChange={(e) => e.target.files?.[0] && addImageAnnotation(e.target.files[0])} />
                     </label>
                   )}
-                  <span style={{ marginLeft: 'auto', fontFamily: 'Poppins, sans-serif', fontSize: 11 }}>
-                    Zoom: {Math.round(viewScale * 100)}%
-                  </span>
-                  <input type='range' min={0.25} max={2.5} step={0.05} value={viewScale}
-                    onChange={(e) => setViewScale(parseFloat(e.target.value))} style={{ width: 80 }} />
+                  <span style={{ marginLeft: 'auto' }} />
+                  <button style={S.btn('#fff', '#000')} onClick={() => setViewScale((s) => Math.max(0.25, +(s - 0.05).toFixed(2)))} title='Zoom out'>{'\u2212'}</button>
+                  <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, minWidth: 40, textAlign: 'center' }}>{Math.round(viewScale * 100)}%</span>
+                  <button style={S.btn('#fff', '#000')} onClick={() => setViewScale((s) => Math.min(2.5, +(s + 0.05).toFixed(2)))} title='Zoom in'>+</button>
                   <button style={S.btn('#fff', '#000')} onClick={fitToWidth} title='Fit page to available width'>⊞ Fit</button>
                   <button style={S.btn('#fff', '#000')} onClick={clearPageAnnotations}>Clear page</button>
+                  <button style={S.btn('#fff', '#000')} onClick={() => setSettingsOpen(true)} title='Settings'>{'\u2699\uFE0F'}</button>
                 </div>
                 {selectedAnnId && (
                   <div style={{ marginTop: 6, display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -1073,7 +1115,7 @@ export default function PdfEditor() {
 
               {/* Scrollable per-page canvas stack */}
               <div ref={scrollContainerRef}
-                style={{ border: '3px solid #000', background: '#888', overflow: 'auto', maxHeight: '75vh', boxShadow: '5px 5px 0 #000', userSelect: 'none' }}
+                style={{ border: fullPage ? 'none' : '3px solid #000', background: '#888', overflow: 'auto', maxHeight: fullPage ? '100%' : '75vh', boxShadow: fullPage ? 'none' : '5px 5px 0 #000', userSelect: 'none', ...(fullPage ? { flex: 1 } : {}) }}
                 onMouseMove={onContainerMove}
                 onMouseUp={onContainerUp}
                 onMouseLeave={onContainerUp}
@@ -1102,7 +1144,7 @@ export default function PdfEditor() {
         </div>
 
         {/* ── Properties + file operations panel ── */}
-        <div style={S.card}>
+        <div style={{ ...S.card, ...(fullPage ? { border: 'none', borderLeft: '2px solid #000', boxShadow: 'none', marginBottom: 0, height: '100%', overflow: 'auto' } : {}) }}>
           <h2 style={S.h2}>📄 PDF Editor</h2>
 
           {/* File operations — always visible */}
