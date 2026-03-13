@@ -1016,50 +1016,64 @@ export default function PdfEditor() {
         </div>
       )}
 
+      {/* ── Empty state: drop zone ── */}
+      {pages.length === 0 && !loading && (
+        <label
+          style={{ border: '3px dashed #000', background: '#f5f5f5', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 500, boxShadow: '5px 5px 0 #000', cursor: 'pointer', ...(fullPage ? { flex: 1 } : {}) }}
+          onDragOver={(e) => { e.preventDefault(); e.currentTarget.style.background = '#e0e7ff'; }}
+          onDragLeave={(e) => { e.currentTarget.style.background = '#f5f5f5'; }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.currentTarget.style.background = '#f5f5f5';
+            const file = e.dataTransfer.files[0];
+            if (file?.type === 'application/pdf') loadPdf(file);
+          }}
+        >
+          <span style={{ fontSize: 48, marginBottom: 12 }}>{'\uD83D\uDCC4'}</span>
+          <p style={{ fontFamily: 'DM Serif Text, serif', fontSize: 22, margin: '0 0 8px', color: '#333' }}>Open a PDF to get started</p>
+          <p style={{ fontFamily: 'Poppins, sans-serif', fontSize: 13, color: '#666', margin: 0 }}>Click here or drag and drop a PDF file</p>
+          <input type='file' accept='application/pdf' style={{ display: 'none' }}
+            onChange={(e) => e.target.files?.[0] && loadPdf(e.target.files[0])} />
+        </label>
+      )}
+      {pages.length === 0 && loading && (
+        <div style={{ border: '3px solid #000', background: '#888', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 500, boxShadow: '5px 5px 0 #000', ...(fullPage ? { flex: 1 } : {}) }}>
+          <p style={{ color: '#eee', fontFamily: 'Poppins, sans-serif', fontSize: 16 }}>Loading… {loadProgress}%</p>
+        </div>
+      )}
+
+      {pages.length > 0 && (
       <div style={{ display: 'grid', gridTemplateColumns: '190px minmax(0, 1fr) 210px', gap: fullPage ? 0 : 12, alignItems: 'start', ...(fullPage ? { flex: 1, overflow: 'hidden' } : {}) }}>
 
         {/* ── Page list sidebar ── */}
-        {pages.length > 0 ? (
-          <div style={{ ...S.card, padding: 10, ...(fullPage ? { border: 'none', borderRight: '2px solid #000', boxShadow: 'none', marginBottom: 0, height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' } : {}) }}>
-            <h2 style={S.h2}>Pages ({pages.length})</h2>
-            <div style={{ maxHeight: fullPage ? undefined : '80vh', overflowY: 'auto', ...(fullPage ? { flex: 1 } : {}) }}>
-              {pages.map((p, idx) => (
-                <div key={p.id}
-                  onClick={() => { setActivePage(p.id); scrollToPage(p.id); }}
-                  style={{ border: `2px solid ${activePage === p.id ? '#000' : '#ddd'}`, background: activePage === p.id ? '#eee' : '#fff', padding: 6, marginBottom: 6, cursor: 'pointer' }}
-                >
-                  <p style={{ ...S.label, marginBottom: 4 }}>Page {idx + 1}</p>
-                  {p.thumbnail ? (
-                    <img src={p.thumbnail} alt={`Page ${idx + 1}`} style={{ width: '100%', display: 'block', border: '1px solid #ccc' }} />
-                  ) : (
-                    <div style={{ width: '100%', aspectRatio: '210/297', background: '#f5f5f5', border: '1px solid #ccc', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <span style={{ fontSize: 11, fontFamily: 'Poppins, sans-serif', color: '#aaa' }}>Blank</span>
-                    </div>
-                  )}
-                  <div style={{ display: 'flex', gap: 3, marginTop: 4 }}>
-                    <button style={S.btn('#fff', '#000')} onClick={(e) => { e.stopPropagation(); movePage(p.id, -1); }}>↑</button>
-                    <button style={S.btn('#fff', '#000')} onClick={(e) => { e.stopPropagation(); movePage(p.id, 1); }}>↓</button>
-                    <button style={S.btn('#f44', '#fff')} onClick={(e) => { e.stopPropagation(); deletePage(p.id); }}>✕</button>
+        <div style={{ ...S.card, padding: 10, ...(fullPage ? { border: 'none', borderRight: '2px solid #000', boxShadow: 'none', marginBottom: 0, height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' } : {}) }}>
+          <h2 style={S.h2}>Pages ({pages.length})</h2>
+          <div style={{ maxHeight: fullPage ? undefined : '80vh', overflowY: 'auto', ...(fullPage ? { flex: 1 } : {}) }}>
+            {pages.map((p, idx) => (
+              <div key={p.id}
+                onClick={() => { setActivePage(p.id); scrollToPage(p.id); }}
+                style={{ border: `2px solid ${activePage === p.id ? '#000' : '#ddd'}`, background: activePage === p.id ? '#eee' : '#fff', padding: 6, marginBottom: 6, cursor: 'pointer' }}
+              >
+                <p style={{ ...S.label, marginBottom: 4 }}>Page {idx + 1}</p>
+                {p.thumbnail ? (
+                  <img src={p.thumbnail} alt={`Page ${idx + 1}`} style={{ width: '100%', display: 'block', border: '1px solid #ccc' }} />
+                ) : (
+                  <div style={{ width: '100%', aspectRatio: '210/297', background: '#f5f5f5', border: '1px solid #ccc', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <span style={{ fontSize: 11, fontFamily: 'Poppins, sans-serif', color: '#aaa' }}>Blank</span>
                   </div>
+                )}
+                <div style={{ display: 'flex', gap: 3, marginTop: 4 }}>
+                  <button style={S.btn('#fff', '#000')} onClick={(e) => { e.stopPropagation(); movePage(p.id, -1); }}>↑</button>
+                  <button style={S.btn('#fff', '#000')} onClick={(e) => { e.stopPropagation(); movePage(p.id, 1); }}>↓</button>
+                  <button style={S.btn('#f44', '#fff')} onClick={(e) => { e.stopPropagation(); deletePage(p.id); }}>✕</button>
                 </div>
-              ))}
-            </div>
+              </div>
+            ))}
           </div>
-        ) : <div />}
+        </div>
 
         {/* ── Main canvas area ── */}
         <div style={{ minWidth: 0, ...(fullPage ? { height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' } : {}) }}>
-          {pages.length === 0 ? (
-            <div style={{ border: '3px solid #000', background: '#888', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 500, boxShadow: '5px 5px 0 #000' }}>
-              {loading ? (
-                <p style={{ color: '#eee', fontFamily: 'Poppins, sans-serif', fontSize: 16 }}>Loading… {loadProgress}%</p>
-              ) : (
-                <p style={{ color: '#eee', fontFamily: 'Poppins, sans-serif', fontSize: 16, textAlign: 'center', lineHeight: 1.8 }}>
-                  Open a PDF to get started
-                </p>
-              )}
-            </div>
-          ) : (
             <>
               {/* Annotation toolbar */}
               <div style={{ ...S.card, padding: 10, marginBottom: fullPage ? 0 : 8, ...(fullPage ? { border: 'none', borderBottom: '2px solid #000', boxShadow: 'none', flexShrink: 0 } : {}) }}>
@@ -1140,7 +1154,6 @@ export default function PdfEditor() {
                 </div>
               </div>
             </>
-          )}
         </div>
 
         {/* ── Properties + file operations panel ── */}
@@ -1293,6 +1306,7 @@ export default function PdfEditor() {
         </div>
 
       </div>
+      )}
     </div>
   );
 }
