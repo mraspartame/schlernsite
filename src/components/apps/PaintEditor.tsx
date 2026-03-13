@@ -414,6 +414,7 @@ export default function PaintEditor() {
   const [smartSelectDownloadPopup, setSmartSelectDownloadPopup] = useState(false);
   const [samActionPopup, setSamActionPopup] = useState<{ screenX: number; screenY: number } | null>(null);
   const [useGrabCut, setUseGrabCut] = useState(() => localStorage.getItem('paint_grabcut') === '1');
+  const [modifyingMask, setModifyingMask] = useState(false);
 
   // Settings popup
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -456,6 +457,8 @@ export default function PaintEditor() {
   /** Stroke points accumulated while user highlights in smart-select mode */
   const samStrokeRef = useRef<{ x: number; y: number }[]>([]);
   const useGrabCutRef = useRef(false); useGrabCutRef.current = useGrabCut;
+  const modifyingMaskRef = useRef(false); modifyingMaskRef.current = modifyingMask;
+  const maskModifyEraseRef = useRef(false); // true = erasing from mask, false = adding
 
   // ── Interaction state (refs to avoid stale closures in handlers) ───────────
   const drawing = useRef(false);
@@ -659,6 +662,21 @@ export default function PaintEditor() {
         }
       }
       overlay.putImageData(imgData, 0, 0);
+    }
+
+    // Mask modify cursor circle preview
+    if (modifyingMaskRef.current && cursorPos.current) {
+      const { x, y } = cursorPos.current;
+      const r = brushSizeRef.current / 2;
+      overlay.save();
+      overlay.strokeStyle = maskModifyEraseRef.current ? '#ff4444' : '#44aaff';
+      overlay.lineWidth = 2;
+      overlay.setLineDash([4, 3]);
+      overlay.beginPath();
+      overlay.arc(x, y, r, 0, Math.PI * 2);
+      overlay.stroke();
+      overlay.setLineDash([]);
+      overlay.restore();
     }
 
     // SAM stroke highlight preview
@@ -1037,6 +1055,23 @@ async function runSmartSelect(
     }
   }
 
+  /** Bake all objects on a layer into its pixel canvas and remove them from the objects array */
+  function flattenLayerObjects(layerId: string) {
+    const pc = pixelCanvases.current.get(layerId);
+    if (!pc) return;
+    const layerObjs = objectsRef.current.filter((o) => o.layerId === layerId);
+    if (layerObjs.length === 0) return;
+    const pcCtx = pc.getContext('2d')!;
+    for (const o of layerObjs) {
+      drawObj(pcCtx, o, imageCache.current);
+    }
+    // Remove flattened objects
+    const remaining = objectsRef.current.filter((o) => o.layerId !== layerId);
+    objectsRef.current = remaining;
+    setObjects(remaining);
+    console.log(`[flattenLayerObjects] baked ${layerObjs.length} objects into pixel canvas for layer ${layerId}`);
+  }
+
   /** Extract masked pixels into a cropped dataURL; optionally erase from source pixel canvas */
   function extractMaskedPixels(mask: { data: boolean[]; dw: number; dh: number }, layerId: string, eraseSource: boolean) {
     const { dw, dh } = mask;
@@ -1081,11 +1116,20 @@ async function runSmartSelect(
     if (eraseSource) {
       const pcCtx = pc.getContext('2d')!;
       const srcImg = pcCtx.getImageData(0, 0, dw, dh);
+      let erasedCount = 0;
       for (let i = 0; i < mask.data.length; i++) {
-        if (mask.data[i]) srcImg.data[i * 4 + 3] = 0;
+        if (mask.data[i]) {
+          if (srcImg.data[i * 4 + 3] > 0) erasedCount++;
+          srcImg.data[i * 4] = 0;
+          srcImg.data[i * 4 + 1] = 0;
+          srcImg.data[i * 4 + 2] = 0;
+          srcImg.data[i * 4 + 3] = 0;
+        }
       }
       pcCtx.putImageData(srcImg, 0, 0);
+      console.log(`[extractMaskedPixels] eraseSource: cleared ${erasedCount} pixels from layer pc ${pc.width}x${pc.height}`);
     }
+    console.log(`[extractMaskedPixels] extracted ${cropW}x${cropH} at (${minX},${minY}), dataUrl length=${dataUrl.length}`);
     return { dataUrl, x: minX, y: minY, w: cropW, h: cropH };
   }
 
@@ -1093,7 +1137,38 @@ async function runSmartSelect(
     samMaskRef.current = null;
     samClickLayerRef.current = null;
     setSamActionPopup(null);
+    setModifyingMask(false);
     renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+  }
+
+  /** Paint (add=true) or erase (add=false) a circle of radius r at (cx,cy) on the mask */
+  function paintMask(cx: number, cy: number, r: number, add: boolean) {
+    const mask = samMaskRef.current;
+    if (!mask) return;
+    const { data, dw, dh } = mask;
+    const x1 = Math.max(0, Math.floor(cx - r));
+    const y1 = Math.max(0, Math.floor(cy - r));
+    const x2 = Math.min(dw - 1, Math.ceil(cx + r));
+    const y2 = Math.min(dh - 1, Math.ceil(cy + r));
+    const r2 = r * r;
+    for (let y = y1; y <= y2; y++) {
+      for (let x = x1; x <= x2; x++) {
+        if ((x - cx) * (x - cx) + (y - cy) * (y - cy) <= r2) {
+          data[y * dw + x] = add;
+        }
+      }
+    }
+  }
+
+  function startModifyMask() {
+    setSamActionPopup(null);
+    setModifyingMask(true);
+  }
+
+  function finishModifyMask() {
+    setModifyingMask(false);
+    // Re-show action popup at center of screen
+    setSamActionPopup({ screenX: window.innerWidth / 2 - 80, screenY: window.innerHeight / 2 - 60 });
   }
 
   function runGrabCutSegment(
@@ -1262,14 +1337,25 @@ async function runSmartSelect(
     const layerId = samClickLayerRef.current;
     if (!mask || !layerId) return;
     saveHistory();
+    // Flatten objects into pixel canvas so we erase the actual visible pixels
+    flattenLayerObjects(layerId);
     const pc = pixelCanvases.current.get(layerId);
-    if (!pc) return;
+    if (!pc) { clearSamSelection(); return; }
+    const dw = mask.dw, dh = mask.dh;
     const pcCtx = pc.getContext('2d')!;
-    const imgData = pcCtx.getImageData(0, 0, mask.dw, mask.dh);
+    const imgData = pcCtx.getImageData(0, 0, dw, dh);
+    let erased = 0;
     for (let i = 0; i < mask.data.length; i++) {
-      if (mask.data[i]) imgData.data[i * 4 + 3] = 0;
+      if (mask.data[i]) {
+        imgData.data[i * 4] = 0;
+        imgData.data[i * 4 + 1] = 0;
+        imgData.data[i * 4 + 2] = 0;
+        imgData.data[i * 4 + 3] = 0;
+        erased++;
+      }
     }
     pcCtx.putImageData(imgData, 0, 0);
+    console.log(`[SmartSelect delete] erased ${erased} pixels from layer ${layerId}`);
     clearSamSelection();
     updateThumbnails();
   }
@@ -1279,6 +1365,7 @@ async function runSmartSelect(
     const layerId = samClickLayerRef.current;
     if (!mask || !layerId) return;
     saveHistory();
+    flattenLayerObjects(layerId);
     const extracted = extractMaskedPixels(mask, layerId, true);
     if (!extracted) { clearSamSelection(); return; }
 
@@ -1319,6 +1406,7 @@ async function runSmartSelect(
     const layerId = samClickLayerRef.current;
     if (!mask || !layerId) return;
     saveHistory();
+    flattenLayerObjects(layerId);
     const extracted = extractMaskedPixels(mask, layerId, true);
     if (!extracted) { clearSamSelection(); return; }
 
@@ -1434,6 +1522,15 @@ async function runSmartSelect(
     drawing.current = true;
     startPos.current = pos;
     lastPos.current = pos;
+
+    // Mask modification mode — paint or erase mask pixels
+    if (modifyingMaskRef.current && samMaskRef.current) {
+      const erase = e.altKey || e.button === 2;
+      maskModifyEraseRef.current = erase;
+      paintMask(pos.x, pos.y, brushSizeRef.current / 2, !erase);
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
+    }
 
     if (t === 'select') {
       // Check handles first (on selected object)
@@ -1579,6 +1676,16 @@ async function runSmartSelect(
     const pos = getPos(e);
     const t = toolRef.current;
 
+    // Mask modification mode
+    if (modifyingMaskRef.current && samMaskRef.current) {
+      cursorPos.current = pos;
+      if (drawing.current) {
+        paintMask(pos.x, pos.y, brushSizeRef.current / 2, !maskModifyEraseRef.current);
+      }
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
+    }
+
     // Text cursor preview
     if (t === 'text') {
       cursorPos.current = pos;
@@ -1708,6 +1815,9 @@ async function runSmartSelect(
     const pos = getPos(e);
     const t = toolRef.current;
     const al = activeLayerRef.current;
+
+    // In mask modify mode, just stop drawing — don't trigger inference
+    if (modifyingMaskRef.current) return;
 
     if (t === 'crop' && startPos.current) {
       const x = Math.min(startPos.current.x, pos.x);
@@ -2263,10 +2373,23 @@ async function runSmartSelect(
             <button style={{ ...S.smallBtn('#166534', '#fff'), textAlign: 'left' }} onClick={smartSelectMakeObject}>
               {'\uD83D\uDCE6'} Make moveable object
             </button>
+            <button style={{ ...S.smallBtn('#7c3aed', '#fff'), textAlign: 'left' }} onClick={startModifyMask}>
+              {'\u270F\uFE0F'} Modify selection
+            </button>
             <button style={{ ...S.smallBtn(), textAlign: 'left' }} onClick={clearSamSelection}>
               {'\u2715'} Cancel
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Mask modify mode floating controls */}
+      {modifyingMask && (
+        <div style={{ position: 'fixed', top: 16, left: '50%', transform: 'translateX(-50%)', zIndex: 9998, background: '#fff', border: '3px solid #000', boxShadow: '4px 4px 0 #000', padding: '10px 16px', fontFamily: 'Poppins, sans-serif', display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 12, fontWeight: 700 }}>Modify Selection</span>
+          <span style={{ fontSize: 11, color: '#666' }}>Click to add · Alt+click or right-click to erase</span>
+          <button style={S.smallBtn('#166534', '#fff')} onClick={finishModifyMask}>Done</button>
+          <button style={S.smallBtn()} onClick={clearSamSelection}>Cancel</button>
         </div>
       )}
 
@@ -2392,6 +2515,7 @@ async function runSmartSelect(
                   {samStatus === 'ready' && !samActionPopup && <p style={{ margin: 0, color: '#166534' }}>Paint over the edges of the object to select it.</p>}
                   {samStatus === 'inferring' && <p style={{ margin: 0, color: '#d97706', fontWeight: 700 }}>Analysing...</p>}
                   {samActionPopup && <p style={{ margin: 0, color: '#000', fontWeight: 700 }}>Selection active. Choose an action.</p>}
+                  {modifyingMask && <p style={{ margin: 0, color: '#7c3aed', fontWeight: 700 }}>Modifying selection. Click to add, Alt/right-click to erase.</p>}
                 </>
               )}
             </div>
@@ -2533,12 +2657,19 @@ async function runSmartSelect(
               style={{ display: 'block', width: '100%', height: '100%', pointerEvents: 'none' }} />
             {/* Overlay (events, selection, preview) */}
             <canvas ref={overlayRef} width={docW} height={docH}
-              style={{ display: 'block', width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : tool === 'smart-select' ? (samStatus === 'inferring' || samStatus === 'downloading' ? 'wait' : 'cell') : 'crosshair' }}
+              style={{ display: 'block', width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, cursor: modifyingMask ? 'none' : tool === 'text' ? 'text' : tool === 'select' ? 'default' : tool === 'smart-select' ? (samStatus === 'inferring' || samStatus === 'downloading' ? 'wait' : 'cell') : 'crosshair' }}
               onMouseDown={onMouseDown}
               onMouseMove={onMouseMove}
               onMouseUp={onMouseUp}
+              onContextMenu={(e) => { if (modifyingMaskRef.current) e.preventDefault(); }}
               onMouseLeave={(e) => {
                 cursorPos.current = null;
+                // In mask modify mode, just stop drawing but keep state
+                if (modifyingMaskRef.current) {
+                  drawing.current = false;
+                  renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+                  return;
+                }
                 // For smart-select, don't end stroke on leave — let user come back on
                 if (toolRef.current === 'smart-select' && drawing.current) {
                   const rect = overlayRef.current!.getBoundingClientRect();
@@ -2559,6 +2690,10 @@ async function runSmartSelect(
                 }
               }}
               onMouseEnter={(e) => {
+                // Resume mask modify drawing when mouse re-enters canvas
+                if (modifyingMaskRef.current && (e.buttons & 1)) {
+                  drawing.current = true;
+                }
                 // Resume smart-select stroke when mouse re-enters canvas
                 if (toolRef.current === 'smart-select' && samStrokeRef.current.length > 0 && (e.buttons & 1)) {
                   drawing.current = true;
