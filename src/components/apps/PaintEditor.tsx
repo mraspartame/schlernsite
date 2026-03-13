@@ -418,6 +418,7 @@ export default function PaintEditor() {
 
   // Settings popup
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [fullPage, setFullPage] = useState(() => localStorage.getItem('paint_fullpage') === '1');
 
   // ── Refs (always-fresh values for event callbacks) ─────────────────────────
   const layersRef = useRef(layers);           layersRef.current = layers;
@@ -2130,11 +2131,15 @@ async function runSmartSelect(
 
   // ── Zoom ──────────────────────────────────────────────────────────────────
 
+  const fullPageRef = useRef(fullPage); fullPageRef.current = fullPage;
   const fitToContainer = useCallback(() => {
     if (canvasContainerRef.current) {
       const containerW = canvasContainerRef.current.clientWidth - 6;
-      // Use the max available height (78vh), not clientHeight which shrinks with content
-      const containerH = window.innerHeight * 0.78;
+      // In full page mode, the container can use the full grid row height.
+      // In normal mode, use 78vh (the maxHeight CSS value), not clientHeight which shrinks with content.
+      const containerH = fullPageRef.current
+        ? canvasContainerRef.current.parentElement!.clientHeight - 6
+        : window.innerHeight * 0.78;
       const z = Math.min(containerW / docWRef.current, containerH / docHRef.current);
       setZoom(z);
       zoomRef.current = z;
@@ -2310,7 +2315,7 @@ async function runSmartSelect(
   // ── JSX ────────────────────────────────────────────────────────────────────
 
   return (
-    <div style={{ maxWidth: 1340, margin: '0 auto' }}>
+    <div style={fullPage ? { position: 'fixed', inset: 0, zIndex: 9000, background: '#fff', display: 'flex', flexDirection: 'column', overflow: 'hidden' } : { maxWidth: 1340, margin: '0 auto' }}>
       {/* Paste dialog */}
       {pasteDialog && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
@@ -2438,12 +2443,35 @@ async function runSmartSelect(
                 For best results, trace closely around the object you want to select.
               </span>
             </div>
+
+            <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '16px 0' }} />
+            <p style={{ ...S.label, marginBottom: 10 }}>DISPLAY</p>
+
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+              <input
+                type='checkbox'
+                checked={fullPage}
+                onChange={(e) => {
+                  setFullPage(e.target.checked);
+                  localStorage.setItem('paint_fullpage', e.target.checked ? '1' : '0');
+                  // Re-fit after layout change
+                  requestAnimationFrame(() => fitToContainer());
+                }}
+                style={{ marginTop: 3, flexShrink: 0, width: 14, height: 14 }}
+              />
+              <span>
+                <span style={{ fontWeight: 700, fontSize: 12, display: 'block', marginBottom: 3 }}>Full page mode</span>
+                <span style={{ fontSize: 11, color: '#555', lineHeight: 1.5, display: 'block' }}>
+                  Hides the site header and expands the editor to fill the entire browser window.
+                </span>
+              </span>
+            </label>
           </div>
         </div>
       )}
 
       {/* Top bar */}
-      <div style={{ border: '3px solid #000', background: '#fff', padding: '8px 12px', marginBottom: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', boxShadow: '4px 4px 0 #000' }}>
+      <div style={{ border: fullPage ? 'none' : '3px solid #000', borderBottom: '3px solid #000', background: '#fff', padding: '8px 12px', marginBottom: fullPage ? 0 : 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', boxShadow: fullPage ? 'none' : '4px 4px 0 #000', flexShrink: 0 }}>
         <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 20 }}>{'\uD83C\uDFA8'} Paint</strong>
         <button style={S.smallBtn()} onClick={newCanvas}>New</button>
         <label style={{ ...S.smallBtn(), cursor: 'pointer' }}>
@@ -2499,10 +2527,10 @@ async function runSmartSelect(
         <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 10, color: '#666' }}>{docW}{'\u00D7'}{docH}</span>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '158px 1fr 192px', gap: 8, alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '158px 1fr 192px', gap: fullPage ? 0 : 8, alignItems: 'start', ...(fullPage ? { flex: 1, overflow: 'hidden' } : {}) }}>
 
         {/* -- Left panel: tools + drawing options -- */}
-        <div style={{ ...S.panel, display: 'flex', flexDirection: 'column', gap: 2 }}>
+        <div style={{ ...S.panel, display: 'flex', flexDirection: 'column', gap: 2, ...(fullPage ? { border: 'none', borderRight: '2px solid #000', height: '100%', overflow: 'auto' } : {}) }}>
           <p style={{ ...S.label, marginBottom: 6 }}>TOOLS</p>
           {TOOLS.map((t) => (
             <button key={t.id} style={S.toolBtn(tool === t.id)} onClick={() => {
@@ -2664,8 +2692,8 @@ async function runSmartSelect(
         </div>
 
         {/* -- Center: canvas -- */}
-        <div ref={canvasContainerRef} style={{ overflow: 'auto', maxHeight: '78vh' }}>
-          <div style={{ width: 'fit-content', margin: '0 auto', border: '3px solid #000', boxShadow: '5px 5px 0 #000', lineHeight: 0 }}>
+        <div ref={canvasContainerRef} style={{ overflow: 'auto', maxHeight: fullPage ? '100%' : '78vh', ...(fullPage ? { height: '100%', background: '#e5e5e5' } : {}) }}>
+          <div style={{ width: 'fit-content', margin: '0 auto', border: '3px solid #000', boxShadow: fullPage ? 'none' : '5px 5px 0 #000', lineHeight: 0 }}>
           <div style={{ width: docW * zoom, height: docH * zoom, position: 'relative' }}>
             {/* Display (composite) */}
             <canvas ref={displayRef} width={docW} height={docH}
@@ -2726,7 +2754,7 @@ async function runSmartSelect(
         </div>
 
         {/* -- Right: layers panel -- */}
-        <div style={S.panel}>
+        <div style={{ ...S.panel, ...(fullPage ? { border: 'none', borderLeft: '2px solid #000', height: '100%', overflow: 'auto' } : {}) }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
             <p style={S.label}>LAYERS</p>
             <button style={S.smallBtn('#000', '#fff')} onClick={addLayer}>+ Add</button>
