@@ -270,6 +270,9 @@ export default function PdfEditor() {
         selectedAnnRef.current = null;
       }
     }
+    // Switch back to select tool after finishing text (consistent with highlight tool)
+    setTool('select');
+    toolRef.current = 'select';
   }
 
   function startAnnEditing(annId: string) {
@@ -599,7 +602,7 @@ export default function PdfEditor() {
     }
 
     if (t === 'text') {
-      if (editingAnnIdRef.current) finishAnnEditing();
+      if (editingAnnIdRef.current) { finishAnnEditing(); return; }
       const dims = measureAnnText('', annFontRef.current, annFontSizeRef.current);
       const newId = uid();
       const newAnn: Annotation = {
