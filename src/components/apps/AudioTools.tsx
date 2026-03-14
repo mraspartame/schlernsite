@@ -208,6 +208,9 @@ function AudioTrimmer() {
   const draggingRef = useRef<'start' | 'end' | null>(null);
   const previewSrcRef = useRef<AudioBufferSourceNode | null>(null);
   const previewCtxRef = useRef<AudioContext | null>(null);
+  const playheadRef = useRef(-1); // current playhead time in seconds, -1 = inactive
+  const rafIdRef = useRef(0);
+  const previewStartTimeRef = useRef(0); // AudioContext time when preview started
 
   startRef.current = startSec;
   endRef.current = endSec;
@@ -279,6 +282,17 @@ function AudioTrimmer() {
     ctx.beginPath();
     ctx.moveTo(ex - 8, 0); ctx.lineTo(ex + 8, 0); ctx.lineTo(ex, 14);
     ctx.closePath(); ctx.fill();
+
+    // Playhead
+    if (playheadRef.current >= 0) {
+      const px = (playheadRef.current / dur) * W;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, H); ctx.stroke();
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, H); ctx.stroke();
+    }
   }, []);
 
   useEffect(() => { drawWave(); }, [startSec, endSec, drawWave]);
@@ -379,8 +393,11 @@ function AudioTrimmer() {
     previewSrcRef.current = null;
     previewCtxRef.current?.close();
     previewCtxRef.current = null;
+    cancelAnimationFrame(rafIdRef.current);
+    playheadRef.current = -1;
     setPreviewing(false);
-  }, []);
+    drawWave();
+  }, [drawWave]);
 
   const startPreview = async () => {
     const buf = bufRef.current;
@@ -400,7 +417,19 @@ function AudioTrimmer() {
     src.onended = stopPreview;
     src.start(0);
     previewSrcRef.current = src;
+    previewStartTimeRef.current = actx.currentTime;
     setPreviewing(true);
+
+    const tick = () => {
+      const ctx2 = previewCtxRef.current;
+      if (!ctx2) return;
+      const elapsed = ctx2.currentTime - previewStartTimeRef.current;
+      playheadRef.current = startRef.current + elapsed;
+      if (playheadRef.current > endRef.current) playheadRef.current = endRef.current;
+      drawWave();
+      rafIdRef.current = requestAnimationFrame(tick);
+    };
+    rafIdRef.current = requestAnimationFrame(tick);
   };
 
   useEffect(() => () => stopPreview(), [stopPreview]);
