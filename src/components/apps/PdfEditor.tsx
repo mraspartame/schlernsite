@@ -23,6 +23,7 @@ interface Annotation {
   naturalAr?: number;
   text?: string;
   fontFamily?: string;
+  fontSize?: number;
   imageSrc?: string;
   rotation?: number;   // degrees (0 = upright)
 }
@@ -133,6 +134,7 @@ export default function PdfEditor() {
   const [tool, setTool] = useState<'select' | 'rect' | 'text' | 'image'>('select');
   const [annColor, setAnnColor] = useState('#000000');
   const [annFont, setAnnFont] = useState('Poppins, sans-serif');
+  const [annFontSize, setAnnFontSize] = useState(16);
   const [loading, setLoading] = useState(false);
   const [loadProgress, setLoadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -158,6 +160,7 @@ export default function PdfEditor() {
   const toolRef = useRef(tool);                 toolRef.current = tool;
   const colorRef = useRef(annColor);            colorRef.current = annColor;
   const annFontRef = useRef(annFont);           annFontRef.current = annFont;
+  const annFontSizeRef = useRef(annFontSize);   annFontSizeRef.current = annFontSize;
   const activePageRef = useRef(activePage);     activePageRef.current = activePage;
 
   const [snapRotation, setSnapRotation] = useState(true);
@@ -229,22 +232,22 @@ export default function PdfEditor() {
 
   // ── Text annotation helpers ────────────────────────────────────────────────
 
-  const ANN_FONT_SIZE = 16;
+  const ANN_FONT_SIZE_DEFAULT = 16;
 
-  function measureAnnText(text: string, fontFamily = 'Poppins, sans-serif'): { w: number; h: number } {
+  function measureAnnText(text: string, fontFamily = 'Poppins, sans-serif', fontSize = ANN_FONT_SIZE_DEFAULT): { w: number; h: number } {
     const c = document.createElement('canvas').getContext('2d')!;
-    c.font = `bold ${ANN_FONT_SIZE}px ${fontFamily}`;
-    const lineH = Math.ceil(ANN_FONT_SIZE * 1.4);
+    c.font = `bold ${fontSize}px ${fontFamily}`;
+    const lineH = Math.ceil(fontSize * 1.4);
     const lines = (text || '').split('\n');
     let maxW = 0;
     for (const line of lines) maxW = Math.max(maxW, c.measureText(line).width);
     return { w: Math.ceil(maxW) || 10, h: lineH * Math.max(1, lines.length) };
   }
 
-  function getAnnCursorXY(text: string, pos: number, fontFamily = 'Poppins, sans-serif'): { x: number; y: number } {
+  function getAnnCursorXY(text: string, pos: number, fontFamily = 'Poppins, sans-serif', fontSize = ANN_FONT_SIZE_DEFAULT): { x: number; y: number } {
     const c = document.createElement('canvas').getContext('2d')!;
-    c.font = `bold ${ANN_FONT_SIZE}px ${fontFamily}`;
-    const lineH = Math.ceil(ANN_FONT_SIZE * 1.4);
+    c.font = `bold ${fontSize}px ${fontFamily}`;
+    const lineH = Math.ceil(fontSize * 1.4);
     const before = text.slice(0, pos);
     const lines = before.split('\n');
     const row = lines.length - 1;
@@ -311,9 +314,10 @@ export default function PdfEditor() {
         ctx.strokeRect(ann.x, ann.y, ann.w, ann.h);
       } else if (ann.type === 'text') {
         const ff = ann.fontFamily ?? 'Poppins, sans-serif';
-        ctx.font = `bold ${ANN_FONT_SIZE}px ${ff}`;
+        const fs = ann.fontSize ?? ANN_FONT_SIZE_DEFAULT;
+        ctx.font = `bold ${fs}px ${ff}`;
         ctx.textBaseline = 'top';
-        const lineH = Math.ceil(ANN_FONT_SIZE * 1.4);
+        const lineH = Math.ceil(fs * 1.4);
         const textLines = (ann.text ?? '').split('\n');
         for (let li = 0; li < textLines.length; li++) {
           ctx.fillStyle = '#fff';
@@ -332,8 +336,8 @@ export default function PdfEditor() {
           if (blink) {
             const txt = ann.text ?? '';
             const cp = Math.min(annCursorPosRef.current, txt.length);
-            const cur = getAnnCursorXY(txt, cp, ff);
-            const curLineH = Math.ceil(ANN_FONT_SIZE * 1.2);
+            const cur = getAnnCursorXY(txt, cp, ff, fs);
+            const curLineH = Math.ceil(fs * 1.2);
             ctx.strokeStyle = ann.color;
             ctx.lineWidth = 1.5;
             ctx.beginPath();
@@ -596,12 +600,13 @@ export default function PdfEditor() {
 
     if (t === 'text') {
       if (editingAnnIdRef.current) finishAnnEditing();
-      const dims = measureAnnText('', annFontRef.current);
+      const dims = measureAnnText('', annFontRef.current, annFontSizeRef.current);
       const newId = uid();
       const newAnn: Annotation = {
         id: newId, pageId, type: 'text',
         x: pos.x, y: pos.y, w: dims.w, h: dims.h,
         color: colorRef.current, text: '', fontFamily: annFontRef.current,
+        fontSize: annFontSizeRef.current,
       };
       const next = [...annotationsRef.current, newAnn];
       annotationsRef.current = next;
@@ -948,31 +953,41 @@ export default function PdfEditor() {
       }
 
       // Second pass: bake annotations onto their pages
+      const curScale = viewScale || 1;
       for (let i = 0; i < pages.length; i++) {
         const entry = pages[i];
         const pageAnns = annotations.filter((a) => a.pageId === entry.id);
-        if (pageAnns.length === 0 || entry.pageNum < 1 || !entry.pdfDoc) continue;
+        if (pageAnns.length === 0) continue;
 
         const pdfPage = newDoc.getPage(i);
         const { width, height } = pdfPage.getSize();
         const SCALE = 2;
 
-        const srcPage = await entry.pdfDoc.getPage(entry.pageNum);
-        const vp = srcPage.getViewport({ scale: SCALE });
         const c = document.createElement('canvas');
-        c.width = vp.width; c.height = vp.height;
         const ctx = c.getContext('2d')!;
-        await srcPage.render({ canvasContext: ctx, viewport: vp }).promise;
 
-        const scaleX = vp.width / width;
-        const scaleY = vp.height / height;
+        if (entry.pageNum >= 1 && entry.pdfDoc) {
+          const srcPage = await entry.pdfDoc.getPage(entry.pageNum);
+          const vp = srcPage.getViewport({ scale: SCALE });
+          c.width = vp.width; c.height = vp.height;
+          await srcPage.render({ canvasContext: ctx, viewport: vp }).promise;
+        } else {
+          // Blank page
+          c.width = Math.round(width * SCALE); c.height = Math.round(height * SCALE);
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(0, 0, c.width, c.height);
+        }
+
+        // Annotation coords are in overlay-canvas space (at viewScale).
+        // Map to save-canvas space: multiply by SCALE / curScale.
+        const sf = SCALE / curScale;
 
         pageAnns.forEach((ann) => {
           ctx.save();
           const rot = ann.rotation ?? 0;
           if (rot !== 0) {
-            const annCX = (ann.x + ann.w / 2) * scaleX;
-            const annCY = (ann.y + ann.h / 2) * scaleY;
+            const annCX = (ann.x + ann.w / 2) * sf;
+            const annCY = (ann.y + ann.h / 2) * sf;
             ctx.translate(annCX, annCY);
             ctx.rotate(toRad(rot));
             ctx.translate(-annCX, -annCY);
@@ -980,25 +995,25 @@ export default function PdfEditor() {
           if (ann.type === 'rect') {
             ctx.globalAlpha = 0.35;
             ctx.fillStyle = ann.color;
-            ctx.fillRect(ann.x * scaleX, ann.y * scaleY, ann.w * scaleX, ann.h * scaleY);
+            ctx.fillRect(ann.x * sf, ann.y * sf, ann.w * sf, ann.h * sf);
             ctx.globalAlpha = 1;
             ctx.strokeStyle = ann.color; ctx.lineWidth = 2;
-            ctx.strokeRect(ann.x * scaleX, ann.y * scaleY, ann.w * scaleX, ann.h * scaleY);
+            ctx.strokeRect(ann.x * sf, ann.y * sf, ann.w * sf, ann.h * sf);
           } else if (ann.type === 'text' && ann.text) {
-            const saveFontSize = 16 * SCALE;
+            const saveFontSize = (ann.fontSize ?? ANN_FONT_SIZE_DEFAULT) * sf;
             ctx.font = `bold ${saveFontSize}px ${ann.fontFamily ?? 'sans-serif'}`;
             ctx.textBaseline = 'top';
             ctx.fillStyle = ann.color;
             const saveLineH = Math.ceil(saveFontSize * 1.4);
             const saveLines = ann.text.split('\n');
             for (let li = 0; li < saveLines.length; li++) {
-              ctx.fillText(saveLines[li], ann.x * scaleX, ann.y * scaleY + li * saveLineH);
+              ctx.fillText(saveLines[li], ann.x * sf, ann.y * sf + li * saveLineH);
             }
           } else if (ann.type === 'image' && ann.imageSrc) {
             const img = imageCache.current.get(ann.imageSrc);
             if (img) {
               ctx.globalAlpha = ann.opacity ?? 1;
-              ctx.drawImage(img, ann.x * scaleX, ann.y * scaleY, ann.w * scaleX, ann.h * scaleY);
+              ctx.drawImage(img, ann.x * sf, ann.y * sf, ann.w * sf, ann.h * sf);
               ctx.globalAlpha = 1;
             }
           }
@@ -1073,7 +1088,7 @@ export default function PdfEditor() {
         if (e.key === 'End') { e.preventDefault(); const nl = oldTxt.indexOf('\n', cp); annCursorPosRef.current = nl === -1 ? oldTxt.length : nl; return; }
 
         const updateAnnText = (newTxt: string, newCp: number) => {
-          const dims = measureAnnText(newTxt, ann.fontFamily);
+          const dims = measureAnnText(newTxt, ann.fontFamily, ann.fontSize);
           const next = annotationsRef.current.map((a) => a.id === eid ? { ...a, text: newTxt, w: dims.w, h: dims.h } : a);
           annotationsRef.current = next;
           setAnnotations(next);
@@ -1230,30 +1245,27 @@ export default function PdfEditor() {
               <div style={{ ...S.card, padding: 10, marginBottom: fullPage ? 0 : 8, ...(fullPage ? { border: 'none', borderBottom: '2px solid #000', boxShadow: 'none', flexShrink: 0 } : {}) }}>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                   <span style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: 12 }}>Tool:</span>
-                  {(['select', 'rect', 'text', 'image'] as const).map((t) => (
-                    <button key={t} style={S.btn(tool === t ? '#000' : '#fff', tool === t ? '#fff' : '#000')} onClick={() => { if (editingAnnIdRef.current) finishAnnEditing(); setTool(t); toolRef.current = t; }}>
-                      {t === 'select' ? '↖ Select' : t === 'rect' ? '▭ Highlight' : t === 'text' ? 'T Text' : '🖼 Image'}
+                  {(['select', 'rect', 'text'] as const).map((t) => (
+                    <button key={t} style={S.btn(tool === t ? '#000' : '#fff', tool === t ? '#fff' : '#000')} onClick={() => {
+                      if (editingAnnIdRef.current) finishAnnEditing();
+                      setTool(t); toolRef.current = t;
+                      if (t === 'rect') { setAnnColor('#ffff00'); colorRef.current = '#ffff00'; }
+                      else if (t === 'text') { setAnnColor('#000000'); colorRef.current = '#000000'; }
+                    }}>
+                      {t === 'select' ? '↖ Select' : t === 'rect' ? '▭ Highlight' : 'T Text'}
                     </button>
                   ))}
+                  <label style={{ ...S.btn('#fff', '#000'), cursor: 'pointer', display: 'inline-block' }} title='Add image'>
+                    🖼
+                    <input type='file' accept='image/*' style={{ display: 'none' }}
+                      onChange={(e) => { if (e.target.files?.[0]) { addImageAnnotation(e.target.files[0]); e.target.value = ''; } }} />
+                  </label>
                   <input type='color' value={annColor} onChange={(e) => setAnnColor(e.target.value)}
                     style={{ width: 32, height: 28, border: '2px solid #000', cursor: 'pointer', padding: 0 }} title='Color' />
-                  {[['#000000', 'Black'], ['#ff0000', 'Red'], ['#0000ff', 'Blue']].map(([c, label]) => (
+                  {[['#000000', 'Black'], ['#ffff00', 'Yellow'], ['#ff0000', 'Red'], ['#0000ff', 'Blue']].map(([c, label]) => (
                     <button key={c} onClick={() => setAnnColor(c)} title={label}
                       style={{ width: 22, height: 22, background: c, border: annColor === c ? '3px solid #0088ff' : '2px solid #ccc', cursor: 'pointer', padding: 0, boxSizing: 'border-box' as const }} />
                   ))}
-                  {tool === 'text' && (
-                    <select value={annFont} onChange={(e) => setAnnFont(e.target.value)}
-                      style={{ border: '2px solid #000', padding: '4px 6px', fontSize: 12, fontFamily: 'Poppins, sans-serif', cursor: 'pointer' }}>
-                      {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
-                    </select>
-                  )}
-                  {tool === 'image' && (
-                    <label style={{ ...S.btn('#fff', '#000'), cursor: 'pointer' }}>
-                      Choose image…
-                      <input type='file' accept='image/*' style={{ display: 'none' }}
-                        onChange={(e) => e.target.files?.[0] && addImageAnnotation(e.target.files[0])} />
-                    </label>
-                  )}
                   <span style={{ marginLeft: 'auto' }} />
                   <button style={S.btn('#fff', '#000')} onClick={() => setViewScale((s) => Math.max(0.25, +(s - 0.05).toFixed(2)))} title='Zoom out'>{'\u2212'}</button>
                   <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, minWidth: 40, textAlign: 'center' }}>{Math.round(viewScale * 100)}%</span>
@@ -1262,15 +1274,6 @@ export default function PdfEditor() {
                   <button style={S.btn('#fff', '#000')} onClick={clearPageAnnotations}>Clear page</button>
                   <button style={S.btn('#fff', '#000')} onClick={() => setSettingsOpen(true)} title='Settings'>{'\u2699\uFE0F'}</button>
                 </div>
-                {selectedAnnId && (
-                  <div style={{ marginTop: 6, display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, fontWeight: 700, color: '#0088ff' }}>Selected:</span>
-                    <button style={S.btn('#f44', '#fff')} onClick={deleteSelectedAnnotation}>✕ Delete</button>
-                    <span style={{ fontFamily: 'Poppins, sans-serif', fontSize: 11, color: '#555' }}>
-                      Drag to move · Drag corner handles to resize · Delete key
-                    </span>
-                  </div>
-                )}
               </div>
 
               {/* Scrollable per-page canvas stack */}
@@ -1370,9 +1373,20 @@ export default function PdfEditor() {
                       <label style={S.label}>Font</label>
                       <select value={selAnn.fontFamily ?? 'Poppins, sans-serif'}
                         onChange={(e) => updateSelAnn({ fontFamily: e.target.value })}
-                        style={{ border: '2px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8, cursor: 'pointer' }}
+                        style={{ border: '2px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 4, cursor: 'pointer' }}
                       >
                         {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                      </select>
+                      <label style={S.label}>Size</label>
+                      <select value={selAnn.fontSize ?? ANN_FONT_SIZE_DEFAULT}
+                        onChange={(e) => {
+                          const fs = parseInt(e.target.value);
+                          const dims = measureAnnText(selAnn.text ?? '', selAnn.fontFamily, fs);
+                          updateSelAnn({ fontSize: fs, w: dims.w, h: dims.h });
+                        }}
+                        style={{ border: '2px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 8, cursor: 'pointer' }}
+                      >
+                        {[8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64].map((s) => <option key={s} value={s}>{s}px</option>)}
                       </select>
                     </>
                   )}
@@ -1431,17 +1445,38 @@ export default function PdfEditor() {
                         Snap to 90°
                       </label>
                     </div>
+                  <hr style={{ margin: '8px 0', border: 'none', borderTop: '1px solid #ccc' }} />
+                  <button style={{ ...S.btn('#c00', '#fff'), ...wideBtn }} onClick={deleteSelectedAnnotation}>
+                    Delete Annotation
+                  </button>
                 </>
               ) : (
-                <p style={{ ...S.p, color: '#888', fontSize: 11 }}>
-                  Select an annotation to edit its properties.
-                  <br /><br />
-                  <strong>Tips:</strong><br />
-                  · Drag to move<br />
-                  · Drag corner handles to resize<br />
-                  · Delete key removes selected<br />
-                  · Escape to deselect
-                </p>
+                <>
+                  {tool === 'text' && (
+                    <div style={{ marginBottom: 10 }}>
+                      <p style={{ ...S.label, color: '#0088ff', marginBottom: 8 }}>TEXT SETTINGS</p>
+                      <label style={S.label}>Font</label>
+                      <select value={annFont} onChange={(e) => setAnnFont(e.target.value)}
+                        style={{ border: '2px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 4, cursor: 'pointer' }}>
+                        {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+                      </select>
+                      <label style={S.label}>Size</label>
+                      <select value={annFontSize} onChange={(e) => setAnnFontSize(parseInt(e.target.value))}
+                        style={{ border: '2px solid #000', padding: '4px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 4, cursor: 'pointer' }}>
+                        {[8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64].map((s) => <option key={s} value={s}>{s}px</option>)}
+                      </select>
+                    </div>
+                  )}
+                  <p style={{ ...S.p, color: '#888', fontSize: 11 }}>
+                    {tool === 'text' ? 'Click on a page to place text.' : 'Select an annotation to edit its properties.'}
+                    <br /><br />
+                    <strong>Tips:</strong><br />
+                    · Drag to move<br />
+                    · Drag corner handles to resize<br />
+                    · Delete key removes selected<br />
+                    · Escape to deselect
+                  </p>
+                </>
               )}
             </>
           )}
