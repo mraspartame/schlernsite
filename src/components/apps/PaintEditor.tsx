@@ -8,10 +8,35 @@ const HANDLE_SZ = 8;  // visual size of handles (px)
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Tool = 'select' | 'pencil' | 'eraser' | 'fill' | 'line' | 'rect' | 'ellipse' | 'text' | 'crop' | 'smart-select';
+type Tool = 'select' | 'pencil' | 'eraser' | 'blur' | 'eyedropper' | 'fill' | 'shape' | 'text' | 'crop' | 'smart-select';
 type SamStatus = 'unloaded' | 'downloading' | 'ready' | 'inferring';
 type BlendMode = 'source-over' | 'multiply' | 'screen' | 'overlay';
 type HandlePos = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+type BrushKind = 'pencil' | 'marker' | 'airbrush' | 'calligraphy';
+
+const BRUSHES: { id: BrushKind; label: string; icon: string }[] = [
+  { id: 'pencil',      label: 'Pencil',      icon: '\u270F\uFE0F' },
+  { id: 'marker',      label: 'Marker',      icon: '\uD83D\uDD8D' },
+  { id: 'airbrush',    label: 'Airbrush',    icon: '\uD83D\uDCA8' },
+  { id: 'calligraphy', label: 'Calligraphy', icon: '\u270D\uFE0F' },
+];
+
+interface EffectShadow { enabled: boolean; color: string; blur: number; offsetX: number; offsetY: number; }
+interface EffectGlow   { enabled: boolean; color: string; blur: number; }
+interface EffectStroke { enabled: boolean; color: string; width: number; }
+interface ObjectEffects {
+  shadow?: EffectShadow;
+  glow?: EffectGlow;
+  stroke?: EffectStroke;
+}
+
+interface GradientFill {
+  enabled: boolean;
+  color1: string;
+  color2: string;
+  angle: number;    // degrees, 0 = left-to-right
+  type: 'linear' | 'radial';
+}
 
 interface Layer {
   id: string;
@@ -19,10 +44,14 @@ interface Layer {
   visible: boolean;
   opacity: number;
   blendMode: BlendMode;
+  effects?: ObjectEffects;
 }
 
 // Moveable objects (shapes, text, images)
-type ObjType = 'rect' | 'ellipse' | 'line' | 'text' | 'image';
+type ShapeKind = 'rect' | 'rect-round' | 'ellipse' | 'circle' | 'line' | 'arrow' | 'triangle' | 'diamond' | 'pentagon' | 'hexagon' | 'star' | 'heart';
+type ObjType = ShapeKind | 'text' | 'image';
+
+const SHAPE_KINDS: ShapeKind[] = ['rect', 'rect-round', 'ellipse', 'circle', 'line', 'arrow', 'triangle', 'diamond', 'pentagon', 'hexagon', 'star', 'heart'];
 
 interface PaintObj {
   id: string;
@@ -33,25 +62,172 @@ interface PaintObj {
   // shape
   strokeColor?: string;
   strokeWidth?: number;
+  fillColor?: string | null;  // null/undefined = no fill
+  fillGradient?: GradientFill; // if enabled, overrides fillColor
   // text
   text?: string;
   fontSize?: number;
   fontFamily?: string;
   color?: string;
+  fontWeight?: 'normal' | 'bold';
+  fontStyle?: 'normal' | 'italic';
+  textAlign?: 'left' | 'center' | 'right';
   // image
   src?: string;
   lockAspect?: boolean;  // maintain aspect ratio on resize
   naturalAr?: number;    // natural w/h ratio
   rotation?: number;     // degrees (0 = upright)
+  // effects
+  effects?: ObjectEffects;
+}
+
+function defaultEffects(): ObjectEffects {
+  return {
+    shadow: { enabled: false, color: '#000000', blur: 8,  offsetX: 4, offsetY: 4 },
+    glow:   { enabled: false, color: '#ffff66', blur: 12 },
+    stroke: { enabled: false, color: '#000000', width: 2 },
+  };
+}
+
+function hasEffects(fx?: ObjectEffects): boolean {
+  return !!(fx && (fx.shadow?.enabled || fx.glow?.enabled || fx.stroke?.enabled));
+}
+
+// ── Shape path builder ────────────────────────────────────────────────────────
+
+function isShapeKind(t: ObjType): t is ShapeKind {
+  return (SHAPE_KINDS as string[]).includes(t);
+}
+
+/**
+ * Builds the path for a shape inside its bounding box (x,y,w,h — w/h may be negative
+ * for drag-in-progress). Does NOT begin or close its own sub-paths for 'line'; the
+ * caller is expected to beginPath() before. For filled shapes the path is closed.
+ */
+function buildShapePath(ctx: CanvasRenderingContext2D, type: ShapeKind, x: number, y: number, w: number, h: number) {
+  // Normalize bounding box for polygon-based shapes
+  const nx = w < 0 ? x + w : x;
+  const ny = h < 0 ? y + h : y;
+  const nw = Math.abs(w);
+  const nh = Math.abs(h);
+  const cx = nx + nw / 2;
+  const cy = ny + nh / 2;
+  const rx = nw / 2;
+  const ry = nh / 2;
+
+  switch (type) {
+    case 'rect':
+      ctx.rect(x, y, w, h);
+      return;
+    case 'rect-round': {
+      const r = Math.min(nw, nh) * 0.15;
+      if (typeof (ctx as any).roundRect === 'function') {
+        (ctx as any).roundRect(nx, ny, nw, nh, r);
+      } else {
+        ctx.moveTo(nx + r, ny);
+        ctx.arcTo(nx + nw, ny, nx + nw, ny + nh, r);
+        ctx.arcTo(nx + nw, ny + nh, nx, ny + nh, r);
+        ctx.arcTo(nx, ny + nh, nx, ny, r);
+        ctx.arcTo(nx, ny, nx + nw, ny, r);
+        ctx.closePath();
+      }
+      return;
+    }
+    case 'ellipse':
+    case 'circle':
+      ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+      return;
+    case 'line':
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + w, y + h);
+      return;
+    case 'arrow':
+      // Arrow is drawn in drawObj with stem + head; this path is the head only.
+      drawArrowHeadPath(ctx, x, y, w, h);
+      return;
+    case 'triangle':
+      ctx.moveTo(cx, ny);
+      ctx.lineTo(nx, ny + nh);
+      ctx.lineTo(nx + nw, ny + nh);
+      ctx.closePath();
+      return;
+    case 'diamond':
+      ctx.moveTo(cx, ny);
+      ctx.lineTo(nx + nw, cy);
+      ctx.lineTo(cx, ny + nh);
+      ctx.lineTo(nx, cy);
+      ctx.closePath();
+      return;
+    case 'pentagon':
+      regularPolygonPath(ctx, cx, cy, rx, ry, 5, -Math.PI / 2);
+      return;
+    case 'hexagon':
+      regularPolygonPath(ctx, cx, cy, rx, ry, 6, -Math.PI / 2);
+      return;
+    case 'star':
+      starPath(ctx, cx, cy, rx, ry, 5, 0.45);
+      return;
+    case 'heart':
+      heartPath(ctx, nx, ny, nw, nh);
+      return;
+  }
+}
+
+function regularPolygonPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, rx: number, ry: number, sides: number, rotation: number) {
+  for (let i = 0; i < sides; i++) {
+    const a = rotation + (i / sides) * Math.PI * 2;
+    const px = cx + Math.cos(a) * rx;
+    const py = cy + Math.sin(a) * ry;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function starPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, rx: number, ry: number, points: number, innerRatio: number) {
+  const step = Math.PI / points;
+  for (let i = 0; i < points * 2; i++) {
+    const r = (i % 2 === 0) ? 1 : innerRatio;
+    const a = -Math.PI / 2 + i * step;
+    const px = cx + Math.cos(a) * rx * r;
+    const py = cy + Math.sin(a) * ry * r;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function heartPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) {
+  const topY = y + h * 0.28;
+  ctx.moveTo(x + w / 2, y + h);
+  ctx.bezierCurveTo(x - w * 0.1, y + h * 0.62, x + w * 0.08, y, x + w / 2, topY);
+  ctx.bezierCurveTo(x + w * 0.92, y, x + w * 1.1, y + h * 0.62, x + w / 2, y + h);
+  ctx.closePath();
+}
+
+function drawArrowHeadPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) {
+  const len = Math.hypot(w, h);
+  if (len < 1) return;
+  const ux = w / len, uy = h / len;
+  const head = Math.min(24, Math.max(8, len * 0.25));
+  const ex = x + w, ey = y + h;
+  const baseX = ex - ux * head, baseY = ey - uy * head;
+  const nxh = -uy * head * 0.55, nyh = ux * head * 0.55;
+  ctx.moveTo(ex, ey);
+  ctx.lineTo(baseX + nxh, baseY + nyh);
+  ctx.lineTo(baseX - nxh, baseY - nyh);
+  ctx.closePath();
 }
 
 // ── Pure utility functions (outside component) ────────────────────────────────
 
 const uid = () => Math.random().toString(36).slice(2, 7);
 
+function isLineLike(t: ObjType) { return t === 'line' || t === 'arrow'; }
+
 /** Bounding box for display/hit-testing (lines have signed w,h for direction) */
 function getDisplayBounds(o: PaintObj) {
-  if (o.type === 'line') {
+  if (isLineLike(o.type)) {
     return {
       x: Math.min(o.x, o.x + o.w),
       y: Math.min(o.y, o.y + o.h),
@@ -80,7 +256,7 @@ function hitTest(o: PaintObj, px: number, py: number): boolean {
     const local = rotatePoint(px, py, cx, cy, toRad(-rot));
     lx = local.x; ly = local.y;
   }
-  if (o.type === 'line') {
+  if (isLineLike(o.type)) {
     const d = ptSegDist(lx, ly, o.x, o.y, o.x + o.w, o.y + o.h);
     return d < (o.strokeWidth ?? 2) / 2 + 6;
   }
@@ -89,7 +265,7 @@ function hitTest(o: PaintObj, px: number, py: number): boolean {
 }
 
 function getHandles(o: PaintObj): { pos: HandlePos; x: number; y: number }[] {
-  if (o.type === 'line') {
+  if (isLineLike(o.type)) {
     return [
       { pos: 'nw', x: o.x, y: o.y },
       { pos: 'se', x: o.x + o.w, y: o.y + o.h },
@@ -126,7 +302,7 @@ function handleAt(o: PaintObj, px: number, py: number): HandlePos | null {
 
 function applyResize(orig: PaintObj, handle: HandlePos, dx: number, dy: number): PaintObj {
   const o = { ...orig };
-  if (o.type === 'line') {
+  if (isLineLike(o.type)) {
     if (handle === 'nw') { o.x += dx; o.y += dy; o.w -= dx; o.h -= dy; }
     if (handle === 'se') { o.w += dx; o.h += dy; }
     return o;
@@ -145,7 +321,7 @@ function applyResize(orig: PaintObj, handle: HandlePos, dx: number, dy: number):
 }
 
 function normBounds(o: PaintObj): PaintObj {
-  if (o.type === 'line') return o;
+  if (isLineLike(o.type)) return o;
   const r = { ...o };
   if (r.w < 0) { r.x += r.w; r.w = -r.w; }
   if (r.h < 0) { r.y += r.h; r.h = -r.h; }
@@ -195,51 +371,78 @@ function rotationHandleHit(o: PaintObj, px: number, py: number): boolean {
   return Math.hypot(px - rh.x, py - rh.y) < HANDLE_R + 4;
 }
 
-function drawObj(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<string, HTMLImageElement>) {
-  ctx.save();
-  ctx.globalAlpha = o.opacity;
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-
-  // Apply rotation around the object's center
-  const rot = o.rotation ?? 0;
-  if (rot !== 0) {
-    const { x, y, w, h } = getDisplayBounds(o);
-    const cx = x + w / 2, cy = y + h / 2;
-    ctx.translate(cx, cy);
-    ctx.rotate(toRad(rot));
-    ctx.translate(-cx, -cy);
+function buildShapeFillStyle(ctx: CanvasRenderingContext2D, o: PaintObj): string | CanvasGradient | null {
+  if (o.fillGradient?.enabled) {
+    const g = o.fillGradient;
+    const nx = o.w < 0 ? o.x + o.w : o.x;
+    const ny = o.h < 0 ? o.y + o.h : o.y;
+    const nw = Math.abs(o.w);
+    const nh = Math.abs(o.h);
+    if (g.type === 'radial') {
+      const cx = nx + nw / 2, cy = ny + nh / 2;
+      const r = Math.max(nw, nh) / 2;
+      const grad = ctx.createRadialGradient(cx, cy, r * 0.05, cx, cy, r);
+      grad.addColorStop(0, g.color1);
+      grad.addColorStop(1, g.color2);
+      return grad;
+    }
+    const rad = toRad(g.angle);
+    const cx = nx + nw / 2, cy = ny + nh / 2;
+    const half = Math.abs(Math.cos(rad)) * nw / 2 + Math.abs(Math.sin(rad)) * nh / 2;
+    const x0 = cx - Math.cos(rad) * half;
+    const y0 = cy - Math.sin(rad) * half;
+    const x1 = cx + Math.cos(rad) * half;
+    const y1 = cy + Math.sin(rad) * half;
+    const grad = ctx.createLinearGradient(x0, y0, x1, y1);
+    grad.addColorStop(0, g.color1);
+    grad.addColorStop(1, g.color2);
+    return grad;
   }
+  return o.fillColor ?? null;
+}
 
-  switch (o.type) {
-    case 'rect':
-      ctx.strokeStyle = o.strokeColor ?? '#000';
-      ctx.lineWidth = o.strokeWidth ?? 2;
-      ctx.lineJoin = 'miter';
+function drawObjCore(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<string, HTMLImageElement>) {
+  if (isShapeKind(o.type)) {
+    ctx.strokeStyle = o.strokeColor ?? '#000';
+    ctx.lineWidth = o.strokeWidth ?? 2;
+    ctx.lineJoin = o.type === 'rect' ? 'miter' : 'round';
+
+    if (o.type === 'arrow') {
+      const len = Math.hypot(o.w, o.h);
+      if (len >= 1) {
+        const ux = o.w / len, uy = o.h / len;
+        const head = Math.min(24, Math.max(8, len * 0.25));
+        const baseX = o.x + o.w - ux * head;
+        const baseY = o.y + o.h - uy * head;
+        ctx.beginPath();
+        ctx.moveTo(o.x, o.y);
+        ctx.lineTo(baseX, baseY);
+        ctx.stroke();
+        ctx.beginPath();
+        drawArrowHeadPath(ctx, o.x, o.y, o.w, o.h);
+        ctx.fillStyle = o.strokeColor ?? '#000';
+        ctx.fill();
+        ctx.stroke();
+      }
+    } else {
       ctx.beginPath();
-      ctx.rect(o.x, o.y, o.w, o.h);
+      buildShapePath(ctx, o.type, o.x, o.y, o.w, o.h);
+      const fs = buildShapeFillStyle(ctx, o);
+      if (fs && o.type !== 'line') {
+        ctx.fillStyle = fs;
+        ctx.fill();
+      }
       ctx.stroke();
-      break;
-    case 'ellipse':
-      ctx.strokeStyle = o.strokeColor ?? '#000';
-      ctx.lineWidth = o.strokeWidth ?? 2;
-      ctx.beginPath();
-      ctx.ellipse(o.x + o.w / 2, o.y + o.h / 2, Math.abs(o.w / 2), Math.abs(o.h / 2), 0, 0, Math.PI * 2);
-      ctx.stroke();
-      break;
-    case 'line':
-      ctx.strokeStyle = o.strokeColor ?? '#000';
-      ctx.lineWidth = o.strokeWidth ?? 2;
-      ctx.beginPath();
-      ctx.moveTo(o.x, o.y);
-      ctx.lineTo(o.x + o.w, o.y + o.h);
-      ctx.stroke();
-      break;
+    }
+  } else switch (o.type) {
     case 'text': {
       ctx.fillStyle = o.color ?? '#000';
       const fSize = o.fontSize ?? 24;
-      ctx.font = `${fSize}px ${o.fontFamily ?? 'Poppins, sans-serif'}`;
+      const wt = o.fontWeight ?? 'normal';
+      const st = o.fontStyle ?? 'normal';
+      ctx.font = `${st} ${wt} ${fSize}px ${o.fontFamily ?? 'Poppins, sans-serif'}`;
       ctx.textBaseline = 'top';
+      ctx.textAlign = 'left';
       const lineH = Math.ceil(fSize * 1.4);
       const textLines = (o.text ?? '').split('\n');
       for (let li = 0; li < textLines.length; li++) {
@@ -253,6 +456,99 @@ function drawObj(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<strin
       break;
     }
   }
+}
+
+/** Draw a stroke/outline effect around the object (text = strokeText, shapes = wider stroke underneath). */
+function drawEffectStroke(ctx: CanvasRenderingContext2D, o: PaintObj, fx: EffectStroke) {
+  ctx.save();
+  ctx.strokeStyle = fx.color;
+  ctx.lineWidth = fx.width * 2;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  if (isShapeKind(o.type)) {
+    if (o.type === 'arrow') {
+      const len = Math.hypot(o.w, o.h);
+      if (len >= 1) {
+        ctx.beginPath();
+        ctx.moveTo(o.x, o.y);
+        ctx.lineTo(o.x + o.w, o.y + o.h);
+        ctx.stroke();
+        ctx.beginPath();
+        drawArrowHeadPath(ctx, o.x, o.y, o.w, o.h);
+        ctx.fillStyle = fx.color;
+        ctx.fill();
+        ctx.stroke();
+      }
+    } else {
+      ctx.beginPath();
+      buildShapePath(ctx, o.type, o.x, o.y, o.w, o.h);
+      ctx.stroke();
+    }
+  } else if (o.type === 'text') {
+    const fSize = o.fontSize ?? 24;
+    const wt = o.fontWeight ?? 'normal';
+    const st = o.fontStyle ?? 'normal';
+    ctx.font = `${st} ${wt} ${fSize}px ${o.fontFamily ?? 'Poppins, sans-serif'}`;
+    ctx.textBaseline = 'top';
+    ctx.miterLimit = 2;
+    const lineH = Math.ceil(fSize * 1.4);
+    const textLines = (o.text ?? '').split('\n');
+    for (let li = 0; li < textLines.length; li++) {
+      ctx.strokeText(textLines[li], o.x, o.y + li * lineH);
+    }
+  }
+  ctx.restore();
+}
+
+function drawObj(ctx: CanvasRenderingContext2D, o: PaintObj, imgCache: Map<string, HTMLImageElement>) {
+  ctx.save();
+  ctx.globalAlpha = o.opacity;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  const rot = o.rotation ?? 0;
+  if (rot !== 0) {
+    const { x, y, w, h } = getDisplayBounds(o);
+    const cx = x + w / 2, cy = y + h / 2;
+    ctx.translate(cx, cy);
+    ctx.rotate(toRad(rot));
+    ctx.translate(-cx, -cy);
+  }
+
+  const fx = o.effects;
+
+  // Outline (stroke effect) — draw first, underneath, so it frames the object
+  if (fx?.stroke?.enabled) {
+    drawEffectStroke(ctx, o, fx.stroke);
+  }
+
+  // Glow effect — blurred copy centered under
+  if (fx?.glow?.enabled) {
+    ctx.save();
+    ctx.shadowColor = fx.glow.color;
+    ctx.shadowBlur = fx.glow.blur;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+    // draw object twice to reinforce glow
+    drawObjCore(ctx, o, imgCache);
+    drawObjCore(ctx, o, imgCache);
+    ctx.restore();
+  }
+
+  // Drop shadow — apply via canvas shadow filter, then draw object
+  if (fx?.shadow?.enabled) {
+    ctx.save();
+    ctx.shadowColor = fx.shadow.color;
+    ctx.shadowBlur = fx.shadow.blur;
+    ctx.shadowOffsetX = fx.shadow.offsetX;
+    ctx.shadowOffsetY = fx.shadow.offsetY;
+    drawObjCore(ctx, o, imgCache);
+    ctx.restore();
+  }
+
+  // The object itself
+  drawObjCore(ctx, o, imgCache);
+
   ctx.restore();
 }
 
@@ -397,6 +693,93 @@ const S = {
   input: { border: '1px solid #000', padding: '3px 6px', width: '100%', boxSizing: 'border-box' as const, fontFamily: 'Poppins, sans-serif', fontSize: 12, marginBottom: 4 },
 };
 
+// ── EffectsEditor (for objects and layers) ────────────────────────────────────
+
+function EffectsEditor({ title, effects, onChange }: {
+  title: string;
+  effects: ObjectEffects | undefined;
+  onChange: (fx: ObjectEffects) => void;
+}) {
+  const fx = effects ?? defaultEffects();
+  const patch = (p: Partial<ObjectEffects>) => onChange({ ...fx, ...p });
+
+  const sh = fx.shadow ?? { enabled: false, color: '#000000', blur: 8, offsetX: 4, offsetY: 4 };
+  const gl = fx.glow ?? { enabled: false, color: '#ffff66', blur: 12 };
+  const st = fx.stroke ?? { enabled: false, color: '#000000', width: 2 };
+
+  return (
+    <>
+      <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
+      <p style={{ ...S.label, marginBottom: 4 }}>{title}</p>
+
+      {/* Drop Shadow */}
+      <label style={{ ...S.label, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+        <input type='checkbox' checked={sh.enabled}
+          onChange={(e) => patch({ shadow: { ...sh, enabled: e.target.checked } })} />
+        Drop shadow
+      </label>
+      {sh.enabled && (
+        <div style={{ padding: 6, border: '1px solid #000', marginBottom: 4, background: '#fafafa' }}>
+          <label style={{ ...S.label, fontSize: 10 }}>Color</label>
+          <input type='color' value={sh.color}
+            onChange={(e) => patch({ shadow: { ...sh, color: e.target.value } })}
+            style={{ width: '100%', height: 22, border: '1px solid #000', padding: 0, cursor: 'pointer', marginBottom: 3 }} />
+          <label style={{ ...S.label, fontSize: 10 }}>Blur: {sh.blur}px</label>
+          <input type='range' min={0} max={60} value={sh.blur}
+            onChange={(e) => patch({ shadow: { ...sh, blur: parseInt(e.target.value) } })}
+            style={{ width: '100%' }} />
+          <label style={{ ...S.label, fontSize: 10 }}>Offset X: {sh.offsetX}px</label>
+          <input type='range' min={-40} max={40} value={sh.offsetX}
+            onChange={(e) => patch({ shadow: { ...sh, offsetX: parseInt(e.target.value) } })}
+            style={{ width: '100%' }} />
+          <label style={{ ...S.label, fontSize: 10 }}>Offset Y: {sh.offsetY}px</label>
+          <input type='range' min={-40} max={40} value={sh.offsetY}
+            onChange={(e) => patch({ shadow: { ...sh, offsetY: parseInt(e.target.value) } })}
+            style={{ width: '100%' }} />
+        </div>
+      )}
+
+      {/* Outer Glow */}
+      <label style={{ ...S.label, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+        <input type='checkbox' checked={gl.enabled}
+          onChange={(e) => patch({ glow: { ...gl, enabled: e.target.checked } })} />
+        Outer glow
+      </label>
+      {gl.enabled && (
+        <div style={{ padding: 6, border: '1px solid #000', marginBottom: 4, background: '#fafafa' }}>
+          <label style={{ ...S.label, fontSize: 10 }}>Color</label>
+          <input type='color' value={gl.color}
+            onChange={(e) => patch({ glow: { ...gl, color: e.target.value } })}
+            style={{ width: '100%', height: 22, border: '1px solid #000', padding: 0, cursor: 'pointer', marginBottom: 3 }} />
+          <label style={{ ...S.label, fontSize: 10 }}>Blur: {gl.blur}px</label>
+          <input type='range' min={0} max={80} value={gl.blur}
+            onChange={(e) => patch({ glow: { ...gl, blur: parseInt(e.target.value) } })}
+            style={{ width: '100%' }} />
+        </div>
+      )}
+
+      {/* Stroke / Outline */}
+      <label style={{ ...S.label, display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+        <input type='checkbox' checked={st.enabled}
+          onChange={(e) => patch({ stroke: { ...st, enabled: e.target.checked } })} />
+        Outline
+      </label>
+      {st.enabled && (
+        <div style={{ padding: 6, border: '1px solid #000', marginBottom: 4, background: '#fafafa' }}>
+          <label style={{ ...S.label, fontSize: 10 }}>Color</label>
+          <input type='color' value={st.color}
+            onChange={(e) => patch({ stroke: { ...st, color: e.target.value } })}
+            style={{ width: '100%', height: 22, border: '1px solid #000', padding: 0, cursor: 'pointer', marginBottom: 3 }} />
+          <label style={{ ...S.label, fontSize: 10 }}>Width: {st.width}px</label>
+          <input type='range' min={1} max={20} value={st.width}
+            onChange={(e) => patch({ stroke: { ...st, width: parseInt(e.target.value) } })}
+            style={{ width: '100%' }} />
+        </div>
+      )}
+    </>
+  );
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function PaintEditor() {
@@ -406,9 +789,16 @@ export default function PaintEditor() {
   const [objects, setObjects] = useState<PaintObj[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [tool, setTool] = useState<Tool>('pencil');
+  const [shapeType, setShapeType] = useState<ShapeKind>('rect');
+  const [shapeFlyoutOpen, setShapeFlyoutOpen] = useState(false);
+  const [fillColor, setFillColor] = useState<string | null>(null);
+  const [fillGradient, setFillGradient] = useState<GradientFill>({ enabled: false, color1: '#ff6b6b', color2: '#4ecdc4', angle: 0, type: 'linear' });
+  const [brushKind, setBrushKind] = useState<BrushKind>('pencil');
+  const [brushFlyoutOpen, setBrushFlyoutOpen] = useState(false);
   const [color, setColor] = useState('#000000');
   const [brushSize, setBrushSize] = useState(4);
   const [opacity, setOpacity] = useState(1);
+  const prevToolRef = useRef<Tool>('pencil'); // for auto-switching back from eyedropper
   const [fontSize, setFontSize] = useState(24);
   const [fontFamily, setFontFamily] = useState('Poppins, sans-serif');
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
@@ -438,6 +828,9 @@ export default function PaintEditor() {
   const [useGrabCut, setUseGrabCut] = useState(() => localStorage.getItem('paint_grabcut') === '1');
   const [modifyingMask, setModifyingMask] = useState(false);
 
+  // Layer effects expand state (only one layer's FX panel at a time)
+  const [expandedFxLayer, setExpandedFxLayer] = useState<string | null>(null);
+
   // Settings popup
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [fullPage, setFullPage] = useState(() => localStorage.getItem('paint_fullpage') === '1');
@@ -450,6 +843,11 @@ export default function PaintEditor() {
   const colorRef = useRef(color);             colorRef.current = color;
   const brushSizeRef = useRef(brushSize);     brushSizeRef.current = brushSize;
   const opacityRef = useRef(opacity);         opacityRef.current = opacity;
+  const shapeTypeRef = useRef(shapeType);     shapeTypeRef.current = shapeType;
+  const fillColorRef = useRef(fillColor);     fillColorRef.current = fillColor;
+  const fillGradientRef = useRef(fillGradient); fillGradientRef.current = fillGradient;
+  const brushKindRef = useRef(brushKind);     brushKindRef.current = brushKind;
+  const lastAirbrushStampRef = useRef(0);
   const editingTextIdRef = useRef(editingTextId); editingTextIdRef.current = editingTextId;
   const textCursorPosRef = useRef(0); // character index within the text being edited
   const fontSizeRef = useRef(fontSize);       fontSizeRef.current = fontSize;
@@ -556,6 +954,29 @@ export default function PaintEditor() {
 
       display.globalAlpha = layer.opacity;
       display.globalCompositeOperation = layer.blendMode;
+
+      // Layer effects — shadow/glow applied by drawing the composite with canvas shadow props
+      const lfx = layer.effects;
+      if (lfx?.glow?.enabled) {
+        display.save();
+        display.shadowColor = lfx.glow.color;
+        display.shadowBlur = lfx.glow.blur;
+        display.shadowOffsetX = 0;
+        display.shadowOffsetY = 0;
+        display.drawImage(tc, 0, 0);
+        display.drawImage(tc, 0, 0);
+        display.restore();
+      }
+      if (lfx?.shadow?.enabled) {
+        display.save();
+        display.shadowColor = lfx.shadow.color;
+        display.shadowBlur = lfx.shadow.blur;
+        display.shadowOffsetX = lfx.shadow.offsetX;
+        display.shadowOffsetY = lfx.shadow.offsetY;
+        display.drawImage(tc, 0, 0);
+        display.restore();
+      }
+
       display.drawImage(tc, 0, 0);
       display.globalAlpha = 1;
       display.globalCompositeOperation = 'source-over';
@@ -617,7 +1038,7 @@ export default function PaintEditor() {
     }
 
     // Draw shape creation preview
-    if (previewShape) {
+    if (previewShape && isShapeKind(previewShape.type)) {
       overlay.save();
       overlay.strokeStyle = colorRef.current;
       overlay.lineWidth = brushSizeRef.current;
@@ -625,18 +1046,21 @@ export default function PaintEditor() {
       overlay.lineCap = 'round';
       overlay.setLineDash([4, 4]);
       const { type, x, y, w, h } = previewShape;
-      if (type === 'rect') {
+      if (fillColorRef.current && !isLineLike(type)) {
         overlay.beginPath();
-        overlay.rect(x, y, w, h);
-        overlay.stroke();
-      } else if (type === 'ellipse') {
+        buildShapePath(overlay, type as ShapeKind, x, y, w, h);
+        overlay.fillStyle = fillColorRef.current;
+        overlay.globalAlpha = opacityRef.current * 0.5;
+        overlay.fill();
+        overlay.globalAlpha = opacityRef.current;
+      }
+      overlay.beginPath();
+      buildShapePath(overlay, type as ShapeKind, x, y, w, h);
+      overlay.stroke();
+      if (type === 'arrow') {
+        // Also show the filled head preview
         overlay.beginPath();
-        overlay.ellipse(x + w / 2, y + h / 2, Math.abs(w / 2), Math.abs(h / 2), 0, 0, Math.PI * 2);
-        overlay.stroke();
-      } else if (type === 'line') {
-        overlay.beginPath();
-        overlay.moveTo(x, y);
-        overlay.lineTo(x + w, y + h);
+        drawArrowHeadPath(overlay, x, y, w, h);
         overlay.stroke();
       }
       overlay.restore();
@@ -1562,6 +1986,153 @@ async function runSmartSelect(
     return ctx;
   }
 
+  // ── Brush variants ────────────────────────────────────────────────────────
+
+  function configureBrush(ctx: CanvasRenderingContext2D, kind: BrushKind, col: string, size: number, op: number) {
+    ctx.strokeStyle = col;
+    ctx.fillStyle = col;
+    ctx.globalAlpha = op;
+    ctx.globalCompositeOperation = 'source-over';
+    switch (kind) {
+      case 'pencil':
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = size;
+        break;
+      case 'marker':
+        ctx.lineCap = 'butt';
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = size * 1.4;
+        ctx.globalAlpha = Math.min(1, op * 0.6);
+        ctx.globalCompositeOperation = 'multiply';
+        break;
+      case 'airbrush':
+        // stamp-based; main line operations are still configured for fallback
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = size;
+        break;
+      case 'calligraphy':
+        ctx.lineCap = 'butt';
+        ctx.lineJoin = 'miter';
+        ctx.lineWidth = size;
+        break;
+    }
+  }
+
+  /** Airbrush stamp — soft radial gradient circle. */
+  function airbrushStamp(ctx: CanvasRenderingContext2D, x: number, y: number, col: string, size: number, op: number) {
+    const r = size;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    // parse color to rgb
+    const hex = col.replace('#', '');
+    const rr = parseInt(hex.slice(0, 2), 16);
+    const gg = parseInt(hex.slice(2, 4), 16);
+    const bb = parseInt(hex.slice(4, 6), 16);
+    g.addColorStop(0, `rgba(${rr},${gg},${bb},${0.25 * op})`);
+    g.addColorStop(1, `rgba(${rr},${gg},${bb},0)`);
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /** Calligraphy stamp — rotated ellipse at a fixed pen angle (~45°). */
+  function calligraphyStamp(ctx: CanvasRenderingContext2D, x: number, y: number, col: string, size: number, op: number) {
+    ctx.save();
+    ctx.globalAlpha = op;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = col;
+    ctx.translate(x, y);
+    ctx.rotate(-Math.PI / 4);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, size / 2, size / 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /** Stamps along a segment at a given spacing. Used by airbrush / calligraphy. */
+  function stampAlongSegment(
+    stamp: (x: number, y: number) => void,
+    x0: number, y0: number, x1: number, y1: number,
+    spacing: number,
+  ) {
+    const dx = x1 - x0, dy = y1 - y0;
+    const dist = Math.hypot(dx, dy);
+    const n = Math.max(1, Math.ceil(dist / spacing));
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      stamp(x0 + dx * t, y0 + dy * t);
+    }
+  }
+
+  /** Box-blur a rectangular region of a canvas in-place. */
+  function blurRegion(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, strength: number) {
+    const cw = ctx.canvas.width, ch = ctx.canvas.height;
+    const x0 = Math.max(0, Math.floor(cx - r));
+    const y0 = Math.max(0, Math.floor(cy - r));
+    const x1 = Math.min(cw, Math.ceil(cx + r));
+    const y1 = Math.min(ch, Math.ceil(cy + r));
+    const w = x1 - x0, h = y1 - y0;
+    if (w <= 1 || h <= 1) return;
+    const img = ctx.getImageData(x0, y0, w, h);
+    const src = img.data;
+    const tmp = new Uint8ClampedArray(src.length);
+    const radius = Math.max(1, Math.round(strength));
+
+    // Circle mask — only blur pixels inside the brush circle, but use full neighborhood
+    // For simplicity we blur the whole rect and then alpha-composite a circle mask on output.
+    // Horizontal pass: tmp from src
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let rs = 0, gs = 0, bs = 0, as = 0, cnt = 0;
+        for (let k = -radius; k <= radius; k++) {
+          const xi = Math.min(w - 1, Math.max(0, x + k));
+          const i = (y * w + xi) * 4;
+          rs += src[i]; gs += src[i + 1]; bs += src[i + 2]; as += src[i + 3];
+          cnt++;
+        }
+        const o = (y * w + x) * 4;
+        tmp[o]     = rs / cnt;
+        tmp[o + 1] = gs / cnt;
+        tmp[o + 2] = bs / cnt;
+        tmp[o + 3] = as / cnt;
+      }
+    }
+    // Vertical pass: src from tmp
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let rs = 0, gs = 0, bs = 0, as = 0, cnt = 0;
+        for (let k = -radius; k <= radius; k++) {
+          const yi = Math.min(h - 1, Math.max(0, y + k));
+          const i = (yi * w + x) * 4;
+          rs += tmp[i]; gs += tmp[i + 1]; bs += tmp[i + 2]; as += tmp[i + 3];
+          cnt++;
+        }
+        const o = (y * w + x) * 4;
+        src[o]     = rs / cnt;
+        src[o + 1] = gs / cnt;
+        src[o + 2] = bs / cnt;
+        src[o + 3] = as / cnt;
+      }
+    }
+    // Composite only the circular area
+    const blurredCanvas = document.createElement('canvas');
+    blurredCanvas.width = w;
+    blurredCanvas.height = h;
+    blurredCanvas.getContext('2d')!.putImageData(img, 0, 0);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.drawImage(blurredCanvas, x0, y0);
+    ctx.restore();
+  }
+
   // ── Mouse event handlers ───────────────────────────────────────────────────
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
@@ -1709,25 +2280,68 @@ async function runSmartSelect(
     if (t === 'pencil' || t === 'eraser') {
       saveHistory();
       strokePoints.current = [pos];
-      ctx.globalAlpha = opacityRef.current;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.lineWidth = t === 'eraser' ? brushSizeRef.current * 3 : brushSizeRef.current;
-      ctx.globalCompositeOperation = t === 'eraser' ? 'destination-out' : 'source-over';
-      ctx.strokeStyle = colorRef.current;
-      ctx.beginPath();
-      ctx.moveTo(pos.x, pos.y);
-      ctx.lineTo(pos.x + 0.1, pos.y + 0.1);
-      ctx.stroke();
+      const bk = brushKindRef.current;
+      if (t === 'eraser') {
+        ctx.globalAlpha = opacityRef.current;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = brushSizeRef.current * 3;
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.strokeStyle = colorRef.current;
+        ctx.beginPath();
+        ctx.moveTo(pos.x, pos.y);
+        ctx.lineTo(pos.x + 0.1, pos.y + 0.1);
+        ctx.stroke();
+      } else {
+        configureBrush(ctx, bk, colorRef.current, brushSizeRef.current, opacityRef.current);
+        if (bk === 'airbrush') {
+          airbrushStamp(ctx, pos.x, pos.y, colorRef.current, brushSizeRef.current, opacityRef.current);
+          lastAirbrushStampRef.current = performance.now();
+        } else if (bk === 'calligraphy') {
+          calligraphyStamp(ctx, pos.x, pos.y, colorRef.current, brushSizeRef.current, opacityRef.current);
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(pos.x, pos.y);
+          ctx.lineTo(pos.x + 0.1, pos.y + 0.1);
+          ctx.stroke();
+        }
+      }
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
+    }
+
+    if (t === 'blur') {
+      saveHistory();
+      strokePoints.current = [pos];
+      blurRegion(ctx, pos.x, pos.y, brushSizeRef.current * 2, Math.max(1, Math.round(brushSizeRef.current / 2)));
       renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
       return;
     }
 
     // Shape creation begins -- save snapshot for live preview
-    if (t === 'line' || t === 'rect' || t === 'ellipse') {
+    if (t === 'shape') {
       saveHistory();
       const dw = docWRef.current, dh = docHRef.current;
       pixelSnapshot.current = pc.getContext('2d')!.getImageData(0, 0, dw, dh);
+    }
+
+    if (t === 'eyedropper') {
+      // Sample the composite display at this position, set it as current color
+      const display = displayRef.current;
+      if (display) {
+        const ctx = display.getContext('2d')!;
+        const px = Math.max(0, Math.min(display.width - 1, Math.round(pos.x)));
+        const py = Math.max(0, Math.min(display.height - 1, Math.round(pos.y)));
+        const [r, g, b] = ctx.getImageData(px, py, 1, 1).data;
+        const hex = '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('');
+        setColor(hex);
+        colorRef.current = hex;
+      }
+      // Return to previous tool after sampling
+      drawing.current = false;
+      const back = prevToolRef.current === 'eyedropper' ? 'pencil' : prevToolRef.current;
+      setTool(back);
+      toolRef.current = back;
     }
   }, [renderAll]);
 
@@ -1854,16 +2468,50 @@ async function runSmartSelect(
     const ctx = pc.getContext('2d')!;
 
     if (t === 'pencil' || t === 'eraser') {
+      const prev = strokePoints.current[strokePoints.current.length - 1] ?? pos;
       strokePoints.current.push(pos);
-      ctx.lineTo(pos.x, pos.y);
-      ctx.stroke();
+      const bk = brushKindRef.current;
+      if (t === 'eraser' || bk === 'pencil' || bk === 'marker') {
+        ctx.lineTo(pos.x, pos.y);
+        ctx.stroke();
+      } else if (bk === 'airbrush') {
+        const col = colorRef.current;
+        const sz = brushSizeRef.current;
+        const op = opacityRef.current;
+        stampAlongSegment((sx, sy) => airbrushStamp(ctx, sx, sy, col, sz, op), prev.x, prev.y, pos.x, pos.y, Math.max(2, sz / 3));
+      } else if (bk === 'calligraphy') {
+        const col = colorRef.current;
+        const sz = brushSizeRef.current;
+        const op = opacityRef.current;
+        stampAlongSegment((sx, sy) => calligraphyStamp(ctx, sx, sy, col, sz, op), prev.x, prev.y, pos.x, pos.y, Math.max(1, sz / 4));
+      }
       renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
-    } else if ((t === 'line' || t === 'rect' || t === 'ellipse') && startPos.current) {
+    } else if (t === 'blur') {
+      const prev = strokePoints.current[strokePoints.current.length - 1] ?? pos;
+      strokePoints.current.push(pos);
+      const r = brushSizeRef.current * 2;
+      const strength = Math.max(1, Math.round(brushSizeRef.current / 2));
+      // Stamp blur along the segment for smooth strokes
+      const dist = Math.hypot(pos.x - prev.x, pos.y - prev.y);
+      const n = Math.max(1, Math.ceil(dist / (r * 0.5)));
+      for (let i = 1; i <= n; i++) {
+        const t2 = i / n;
+        const sx = prev.x + (pos.x - prev.x) * t2;
+        const sy = prev.y + (pos.y - prev.y) * t2;
+        blurRegion(ctx, sx, sy, r, strength);
+      }
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+    } else if (t === 'shape' && startPos.current) {
       const x = startPos.current.x;
       const y = startPos.current.y;
-      const w = pos.x - x;
-      const h = pos.y - y;
-      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current, { type: t, x, y, w, h });
+      let w = pos.x - x;
+      let h = pos.y - y;
+      if (shapeTypeRef.current === 'circle') {
+        const s = Math.max(Math.abs(w), Math.abs(h));
+        w = s * (w < 0 ? -1 : 1);
+        h = s * (h < 0 ? -1 : 1);
+      }
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current, { type: shapeTypeRef.current, x, y, w, h });
     }
     lastPos.current = pos;
   }, [renderAll]);
@@ -1970,12 +2618,12 @@ async function runSmartSelect(
     if (!pc) return;
     const ctx = pc.getContext('2d')!;
 
-    if (t === 'pencil' || t === 'eraser') {
+    if (t === 'pencil' || t === 'eraser' || t === 'blur') {
       ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = 'source-over';
     }
 
-    if ((t === 'line' || t === 'rect' || t === 'ellipse') && startPos.current) {
+    if (t === 'shape' && startPos.current) {
       const x = startPos.current.x;
       const y = startPos.current.y;
       let w = pos.x - x;
@@ -1987,14 +2635,23 @@ async function runSmartSelect(
         return;
       }
 
+      const kind = shapeTypeRef.current;
+      if (kind === 'circle') {
+        const s = Math.max(Math.abs(w), Math.abs(h));
+        w = s * (w < 0 ? -1 : 1);
+        h = s * (h < 0 ? -1 : 1);
+      }
+
       const newObj: PaintObj = {
-        id: uid(), layerId: al, type: t,
+        id: uid(), layerId: al, type: kind,
         x, y, w, h,
         opacity: opacityRef.current,
         strokeColor: colorRef.current,
         strokeWidth: brushSizeRef.current,
+        fillColor: fillColorRef.current,
+        fillGradient: fillGradientRef.current.enabled ? { ...fillGradientRef.current } : undefined,
       };
-      const next = normBounds(newObj.type === 'line' ? newObj : newObj);
+      const next = normBounds(newObj);
       const objs = [...objectsRef.current, next];
       objectsRef.current = objs;
       setObjects(objs);
@@ -2501,16 +3158,31 @@ async function runSmartSelect(
 
   const TOOLS: { id: Tool; label: string; icon: string }[] = [
     { id: 'select', label: 'Select', icon: '\u2196' },
-    { id: 'pencil', label: 'Pencil', icon: '\u270F\uFE0F' },
+    { id: 'pencil', label: 'Brush', icon: '\u270F\uFE0F' },
     { id: 'eraser', label: 'Eraser', icon: '\uD83E\uDDF9' },
+    { id: 'blur',   label: 'Blur',   icon: '\uD83D\uDCA7' },
     { id: 'fill', label: 'Fill', icon: '\uD83E\uDEA3' },
-    { id: 'line', label: 'Line', icon: '\u2571' },
-    { id: 'rect', label: 'Rect', icon: '\u25AD' },
-    { id: 'ellipse', label: 'Ellipse', icon: '\u25EF' },
+    { id: 'eyedropper', label: 'Eyedropper', icon: '\uD83D\uDC41' },
+    { id: 'shape', label: 'Shapes', icon: '\u25A2' },
     { id: 'text', label: 'Text', icon: 'T' },
     { id: 'crop', label: 'Crop', icon: '\u2702' },
     { id: 'smart-select', label: 'Smart Select', icon: '\u2728' },
   ];
+
+  const SHAPE_ICONS: Record<ShapeKind, { icon: string; label: string }> = {
+    'rect':       { icon: '\u25AD', label: 'Rectangle' },
+    'rect-round': { icon: '\u25A2', label: 'Rounded rect' },
+    'ellipse':    { icon: '\u2B2D', label: 'Ellipse' },
+    'circle':     { icon: '\u25EF', label: 'Circle' },
+    'line':       { icon: '\u2571', label: 'Line' },
+    'arrow':      { icon: '\u2197', label: 'Arrow' },
+    'triangle':   { icon: '\u25B3', label: 'Triangle' },
+    'diamond':    { icon: '\u25C7', label: 'Diamond' },
+    'pentagon':   { icon: '\u2B1F', label: 'Pentagon' },
+    'hexagon':    { icon: '\u2B22', label: 'Hexagon' },
+    'star':       { icon: '\u2606', label: 'Star' },
+    'heart':      { icon: '\u2661', label: 'Heart' },
+  };
 
   const BLENDS: BlendMode[] = ['source-over', 'multiply', 'screen', 'overlay'];
 
@@ -2735,16 +3407,122 @@ async function runSmartSelect(
         <div style={{ ...S.panel, display: 'flex', flexDirection: 'column', gap: 2, ...(fullPage ? { border: 'none', borderRight: '2px solid #000', height: '100%', overflow: 'auto' } : {}) }}>
           <p style={{ ...S.label, marginBottom: 6 }}>TOOLS</p>
           {TOOLS.map((t) => (
-            <button key={t.id} style={S.toolBtn(tool === t.id)} onClick={() => {
-              if (editingTextIdRef.current) finishTextEditing();
-              setTool(t.id);
-              toolRef.current = t.id;
-              if (t.id !== 'text') cursorPos.current = null;
-              renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
-            }}>
-              {t.icon} {t.label}
-            </button>
+            <div key={t.id} style={{ position: 'relative' }}>
+              <button
+                style={{ ...S.toolBtn(tool === t.id), width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+                onClick={() => {
+                  if (editingTextIdRef.current) finishTextEditing();
+                  if (t.id === 'shape') {
+                    setShapeFlyoutOpen((o) => !o);
+                    setBrushFlyoutOpen(false);
+                  } else if (t.id === 'pencil') {
+                    setBrushFlyoutOpen((o) => !o);
+                    setShapeFlyoutOpen(false);
+                  } else {
+                    setShapeFlyoutOpen(false);
+                    setBrushFlyoutOpen(false);
+                  }
+                  if (toolRef.current !== 'eyedropper' && t.id === 'eyedropper') {
+                    prevToolRef.current = toolRef.current;
+                  }
+                  setTool(t.id);
+                  toolRef.current = t.id;
+                  if (t.id !== 'text') cursorPos.current = null;
+                  renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+                }}
+              >
+                <span>{t.icon} {t.label}</span>
+                {(t.id === 'shape' || t.id === 'pencil') && (
+                  <span style={{ fontSize: 10, opacity: 0.6 }}>
+                    {(t.id === 'shape' ? shapeFlyoutOpen : brushFlyoutOpen) ? '\u25BE' : '\u25B8'}
+                  </span>
+                )}
+              </button>
+              {t.id === 'pencil' && brushFlyoutOpen && (
+                <div style={{ position: 'absolute', left: 'calc(100% + 6px)', top: 0, zIndex: 50, background: '#fff', border: '3px solid #000', boxShadow: '4px 4px 0 #000', padding: 6, display: 'flex', flexDirection: 'column', gap: 4, minWidth: 130 }}>
+                  {BRUSHES.map((b) => (
+                    <button
+                      key={b.id}
+                      title={b.label}
+                      onClick={() => {
+                        setBrushKind(b.id);
+                        brushKindRef.current = b.id;
+                        setTool('pencil');
+                        toolRef.current = 'pencil';
+                        setBrushFlyoutOpen(false);
+                      }}
+                      style={{
+                        border: brushKind === b.id ? '3px solid #0088ff' : '2px solid #000',
+                        background: brushKind === b.id ? '#e6f4ff' : '#fff',
+                        cursor: 'pointer',
+                        fontSize: 12,
+                        padding: '4px 8px',
+                        textAlign: 'left',
+                        fontFamily: 'Poppins, sans-serif',
+                        fontWeight: 700,
+                      }}
+                    >
+                      {b.icon} {b.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {t.id === 'shape' && shapeFlyoutOpen && (
+                <div style={{ position: 'absolute', left: 'calc(100% + 6px)', top: 0, zIndex: 50, background: '#fff', border: '3px solid #000', boxShadow: '4px 4px 0 #000', padding: 6, display: 'grid', gridTemplateColumns: 'repeat(3, 32px)', gap: 4 }}>
+                  {SHAPE_KINDS.map((k) => (
+                    <button
+                      key={k}
+                      title={SHAPE_ICONS[k].label}
+                      onClick={() => {
+                        setShapeType(k);
+                        shapeTypeRef.current = k;
+                        setTool('shape');
+                        toolRef.current = 'shape';
+                        setShapeFlyoutOpen(false);
+                      }}
+                      style={{
+                        width: 32, height: 32,
+                        border: shapeType === k ? '3px solid #0088ff' : '2px solid #000',
+                        background: shapeType === k ? '#e6f4ff' : '#fff',
+                        cursor: 'pointer',
+                        fontSize: 16,
+                        padding: 0,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontFamily: 'Poppins, sans-serif',
+                      }}
+                    >
+                      {SHAPE_ICONS[k].icon}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           ))}
+
+          {tool === 'shape' && (
+            <div style={{ fontSize: 11, fontFamily: 'Poppins, sans-serif', marginTop: 4, color: '#444' }}>
+              Shape: <strong>{SHAPE_ICONS[shapeType].label}</strong>
+              {shapeType === 'circle' && <span style={{ color: '#666' }}> (1:1)</span>}
+            </div>
+          )}
+
+          {tool === 'pencil' && (
+            <div style={{ fontSize: 11, fontFamily: 'Poppins, sans-serif', marginTop: 4, color: '#444' }}>
+              Brush: <strong>{BRUSHES.find((b) => b.id === brushKind)?.label}</strong>
+            </div>
+          )}
+
+          {tool === 'blur' && (
+            <p style={{ fontSize: 11, fontFamily: 'Poppins, sans-serif', margin: '4px 0 0', color: '#666' }}>
+              Drag to soften pixels on the active layer.
+            </p>
+          )}
+
+          {tool === 'eyedropper' && (
+            <p style={{ fontSize: 11, fontFamily: 'Poppins, sans-serif', margin: '4px 0 0', color: '#666' }}>
+              Click anywhere on the canvas to pick a color.
+            </p>
+          )}
 
           <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
 
@@ -2773,7 +3551,7 @@ async function runSmartSelect(
             <>
               <p style={{ ...S.label, color: '#0088ff' }}>SELECTED: {selObj.type.toUpperCase()}</p>
 
-              {(selObj.type === 'rect' || selObj.type === 'ellipse' || selObj.type === 'line') && (
+              {isShapeKind(selObj.type) && (
                 <>
                   <label style={S.label}>Stroke color</label>
                   <input type='color' value={selObj.strokeColor ?? '#000000'}
@@ -2783,6 +3561,63 @@ async function runSmartSelect(
                   <input type='range' min={1} max={30} value={selObj.strokeWidth ?? 2}
                     onChange={(e) => updateSelectedObj({ strokeWidth: parseInt(e.target.value) })}
                     style={{ width: '100%' }} />
+
+                  {!isLineLike(selObj.type) && (
+                    <>
+                      <label style={{ ...S.label, marginTop: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <input
+                          type='checkbox'
+                          checked={!!selObj.fillColor && !selObj.fillGradient?.enabled}
+                          onChange={(e) => updateSelectedObj({ fillColor: e.target.checked ? (selObj.fillColor ?? '#ffffff') : null, fillGradient: undefined })}
+                        />
+                        Fill
+                      </label>
+                      {selObj.fillColor && !selObj.fillGradient?.enabled && (
+                        <input type='color' value={selObj.fillColor}
+                          onChange={(e) => updateSelectedObj({ fillColor: e.target.value })}
+                          style={{ width: '100%', height: 30, border: '2px solid #000', padding: 0, cursor: 'pointer', marginBottom: 4 }} />
+                      )}
+                      <label style={{ ...S.label, marginTop: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <input
+                          type='checkbox'
+                          checked={!!selObj.fillGradient?.enabled}
+                          onChange={(e) => {
+                            const g: GradientFill = selObj.fillGradient
+                              ? { ...selObj.fillGradient, enabled: e.target.checked }
+                              : { enabled: e.target.checked, color1: '#ff6b6b', color2: '#4ecdc4', angle: 0, type: 'linear' };
+                            updateSelectedObj({ fillGradient: g, fillColor: selObj.fillColor ?? '#ffffff' });
+                          }}
+                        />
+                        Gradient fill
+                      </label>
+                      {selObj.fillGradient?.enabled && (
+                        <div style={{ padding: 6, border: '1px solid #000', marginBottom: 4, background: '#fafafa' }}>
+                          <div style={{ display: 'flex', gap: 3, marginBottom: 4 }}>
+                            <button style={{ ...S.smallBtn(selObj.fillGradient.type === 'linear' ? '#000' : '#fff', selObj.fillGradient.type === 'linear' ? '#fff' : '#000'), flex: 1 }}
+                              onClick={() => updateSelectedObj({ fillGradient: { ...selObj.fillGradient!, type: 'linear' } })}>Linear</button>
+                            <button style={{ ...S.smallBtn(selObj.fillGradient.type === 'radial' ? '#000' : '#fff', selObj.fillGradient.type === 'radial' ? '#fff' : '#000'), flex: 1 }}
+                              onClick={() => updateSelectedObj({ fillGradient: { ...selObj.fillGradient!, type: 'radial' } })}>Radial</button>
+                          </div>
+                          <label style={{ ...S.label, fontSize: 10 }}>Start</label>
+                          <input type='color' value={selObj.fillGradient.color1}
+                            onChange={(e) => updateSelectedObj({ fillGradient: { ...selObj.fillGradient!, color1: e.target.value } })}
+                            style={{ width: '100%', height: 22, border: '1px solid #000', padding: 0, cursor: 'pointer', marginBottom: 3 }} />
+                          <label style={{ ...S.label, fontSize: 10 }}>End</label>
+                          <input type='color' value={selObj.fillGradient.color2}
+                            onChange={(e) => updateSelectedObj({ fillGradient: { ...selObj.fillGradient!, color2: e.target.value } })}
+                            style={{ width: '100%', height: 22, border: '1px solid #000', padding: 0, cursor: 'pointer', marginBottom: 3 }} />
+                          {selObj.fillGradient.type === 'linear' && (
+                            <>
+                              <label style={{ ...S.label, fontSize: 10 }}>Angle: {selObj.fillGradient.angle}{'\u00B0'}</label>
+                              <input type='range' min={0} max={359} value={selObj.fillGradient.angle}
+                                onChange={(e) => updateSelectedObj({ fillGradient: { ...selObj.fillGradient!, angle: parseInt(e.target.value) } })}
+                                style={{ width: '100%' }} />
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
                 </>
               )}
 
@@ -2797,6 +3632,16 @@ async function runSmartSelect(
                     style={{ width: '100%', border: '1px solid #000', padding: '3px 4px', fontFamily: 'Poppins, sans-serif', fontSize: 11, marginBottom: 4 }}>
                     {FONTS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
                   </select>
+                  <div style={{ display: 'flex', gap: 3, marginBottom: 4 }}>
+                    <button
+                      style={S.smallBtn(selObj.fontWeight === 'bold' ? '#000' : '#fff', selObj.fontWeight === 'bold' ? '#fff' : '#000')}
+                      onClick={() => updateSelectedObj({ fontWeight: selObj.fontWeight === 'bold' ? 'normal' : 'bold' })}
+                    ><strong>B</strong></button>
+                    <button
+                      style={S.smallBtn(selObj.fontStyle === 'italic' ? '#000' : '#fff', selObj.fontStyle === 'italic' ? '#fff' : '#000')}
+                      onClick={() => updateSelectedObj({ fontStyle: selObj.fontStyle === 'italic' ? 'normal' : 'italic' })}
+                    ><em>I</em></button>
+                  </div>
                   <label style={S.label}>Color</label>
                   <input type='color' value={selObj.color ?? '#000000'}
                     onChange={(e) => updateSelectedObj({ color: e.target.value })}
@@ -2839,6 +3684,14 @@ async function runSmartSelect(
                 <input type='checkbox' checked={snapRotation} onChange={(e) => setSnapRotation(e.target.checked)} />
                 Snap to 90{'\u00B0'}
               </label>
+
+              {(selObj.type === 'text' || isShapeKind(selObj.type) || selObj.type === 'image') && (
+                <EffectsEditor
+                  title='EFFECTS'
+                  effects={selObj.effects}
+                  onChange={(fx) => updateSelectedObj({ effects: fx })}
+                />
+              )}
             </>
           ) : (
             <>
@@ -2862,6 +3715,74 @@ async function runSmartSelect(
               <input type='range' min={0} max={100} value={Math.round(opacity * 100)}
                 onChange={(e) => setOpacity(parseInt(e.target.value) / 100)}
                 style={{ width: '100%' }} />
+
+              {tool === 'shape' && !isLineLike(shapeType) && (
+                <>
+                  <label style={{ ...S.label, marginTop: 8, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input
+                      type='checkbox'
+                      checked={fillColor !== null}
+                      onChange={(e) => {
+                        const next = e.target.checked ? (fillColor ?? '#ffffff') : null;
+                        setFillColor(next);
+                        fillColorRef.current = next;
+                      }}
+                    />
+                    Fill shape
+                  </label>
+                  {fillColor !== null && !fillGradient.enabled && (
+                    <input type='color' value={fillColor}
+                      onChange={(e) => { setFillColor(e.target.value); fillColorRef.current = e.target.value; }}
+                      style={{ width: '100%', height: 30, border: '2px solid #000', padding: 0, cursor: 'pointer', marginBottom: 4 }} />
+                  )}
+                  <label style={{ ...S.label, marginTop: 4, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input
+                      type='checkbox'
+                      checked={fillGradient.enabled}
+                      onChange={(e) => {
+                        const g = { ...fillGradient, enabled: e.target.checked };
+                        setFillGradient(g);
+                        fillGradientRef.current = g;
+                        if (e.target.checked && fillColor === null) {
+                          setFillColor('#ffffff');
+                          fillColorRef.current = '#ffffff';
+                        }
+                      }}
+                    />
+                    Gradient
+                  </label>
+                  {fillGradient.enabled && (
+                    <div style={{ padding: 6, border: '1px solid #000', marginBottom: 4, background: '#fafafa' }}>
+                      <div style={{ display: 'flex', gap: 3, marginBottom: 4 }}>
+                        <button
+                          style={{ ...S.smallBtn(fillGradient.type === 'linear' ? '#000' : '#fff', fillGradient.type === 'linear' ? '#fff' : '#000'), flex: 1 }}
+                          onClick={() => { const g = { ...fillGradient, type: 'linear' as const }; setFillGradient(g); fillGradientRef.current = g; }}
+                        >Linear</button>
+                        <button
+                          style={{ ...S.smallBtn(fillGradient.type === 'radial' ? '#000' : '#fff', fillGradient.type === 'radial' ? '#fff' : '#000'), flex: 1 }}
+                          onClick={() => { const g = { ...fillGradient, type: 'radial' as const }; setFillGradient(g); fillGradientRef.current = g; }}
+                        >Radial</button>
+                      </div>
+                      <label style={{ ...S.label, fontSize: 10 }}>Start</label>
+                      <input type='color' value={fillGradient.color1}
+                        onChange={(e) => { const g = { ...fillGradient, color1: e.target.value }; setFillGradient(g); fillGradientRef.current = g; }}
+                        style={{ width: '100%', height: 22, border: '1px solid #000', padding: 0, cursor: 'pointer', marginBottom: 3 }} />
+                      <label style={{ ...S.label, fontSize: 10 }}>End</label>
+                      <input type='color' value={fillGradient.color2}
+                        onChange={(e) => { const g = { ...fillGradient, color2: e.target.value }; setFillGradient(g); fillGradientRef.current = g; }}
+                        style={{ width: '100%', height: 22, border: '1px solid #000', padding: 0, cursor: 'pointer', marginBottom: 3 }} />
+                      {fillGradient.type === 'linear' && (
+                        <>
+                          <label style={{ ...S.label, fontSize: 10 }}>Angle: {fillGradient.angle}{'\u00B0'}</label>
+                          <input type='range' min={0} max={359} value={fillGradient.angle}
+                            onChange={(e) => { const g = { ...fillGradient, angle: parseInt(e.target.value) }; setFillGradient(g); fillGradientRef.current = g; }}
+                            style={{ width: '100%' }} />
+                        </>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
 
               {tool === 'text' && (
                 <>
@@ -3027,6 +3948,22 @@ async function runSmartSelect(
                 >
                   {BLENDS.map((b) => <option key={b} value={b}>{b}</option>)}
                 </select>
+              </div>
+              <div style={{ marginTop: 4 }} onClick={(e) => e.stopPropagation()}>
+                <button
+                  style={{ ...S.smallBtn(expandedFxLayer === layer.id ? '#000' : '#fff', expandedFxLayer === layer.id ? '#fff' : '#000'), width: '100%', fontSize: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                  onClick={() => setExpandedFxLayer((id) => id === layer.id ? null : layer.id)}
+                >
+                  <span>FX {hasEffects(layer.effects) ? '\u2713' : ''}</span>
+                  <span style={{ opacity: 0.6 }}>{expandedFxLayer === layer.id ? '\u25BE' : '\u25B8'}</span>
+                </button>
+                {expandedFxLayer === layer.id && (
+                  <EffectsEditor
+                    title='LAYER EFFECTS'
+                    effects={layer.effects}
+                    onChange={(fx) => updateLayer(layer.id, { effects: fx })}
+                  />
+                )}
               </div>
             </div>
           ))}
