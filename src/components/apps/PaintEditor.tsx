@@ -803,7 +803,6 @@ export default function PaintEditor() {
   const [fontFamily, setFontFamily] = useState('Poppins, sans-serif');
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
   const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
-  const [snapRotation, setSnapRotation] = useState(true);
 
   // Document dimensions (dynamic - changes on crop)
   const [docW, setDocW] = useState(DEFAULT_W);
@@ -830,6 +829,10 @@ export default function PaintEditor() {
 
   // Layer effects expand state (only one layer's FX panel at a time)
   const [expandedFxLayer, setExpandedFxLayer] = useState<string | null>(null);
+
+  // Object context menu (right-click on a selected object)
+  const [contextMenu, setContextMenu] = useState<{ screenX: number; screenY: number; objectId: string } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
 
   // Settings popup
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -895,7 +898,6 @@ export default function PaintEditor() {
   const dragOrigObj = useRef<PaintObj | null>(null);
   const dragStartAngle = useRef(0);
   const dragStartRotation = useRef(0);
-  const snapToRef = useRef(snapRotation); snapToRef.current = snapRotation;
 
   // For text cursor preview
   const cursorPos = useRef<{ x: number; y: number } | null>(null);
@@ -2417,12 +2419,7 @@ async function runSmartSelect(
         const cx = x + w / 2, cy = y + h / 2;
         const angle = Math.atan2(pos.y - cy, pos.x - cx);
         const delta = (angle - dragStartAngle.current) * 180 / Math.PI;
-        let newRot = ((dragStartRotation.current + delta) % 360 + 360) % 360;
-        // Snap within 8deg of any 90deg multiple
-        if (snapToRef.current) {
-          const nearest = Math.round(newRot / 90) * 90 % 360;
-          if (Math.abs(newRot - nearest) < 8) newRot = nearest;
-        }
+        const newRot = ((dragStartRotation.current + delta) % 360 + 360) % 360;
         const objs = objectsRef.current.map((o) => o.id === selId ? { ...o, rotation: newRot } : o);
         objectsRef.current = objs;
         setObjects(objs);
@@ -2733,6 +2730,38 @@ async function runSmartSelect(
     renderAll(layersRef.current, objs, id);
   }, [renderAll]);
 
+  const moveObjectToLayer = useCallback((objectId: string, targetLayerId: string) => {
+    saveHistory();
+    const objs = objectsRef.current.map((o) => (o.id === objectId ? { ...o, layerId: targetLayerId } : o));
+    objectsRef.current = objs;
+    setObjects(objs);
+    renderAll(layersRef.current, objs, selectedIdRef.current);
+  }, [renderAll]);
+
+  const moveObjectToNewLayer = useCallback((objectId: string) => {
+    saveHistory();
+    const id = uid();
+    pixelCanvases.current.set(id, makePixelCanvas());
+    const layer: Layer = { id, name: `Layer ${layersRef.current.length + 1}`, visible: true, opacity: 1, blendMode: 'source-over' };
+    const nextLayers = [...layersRef.current, layer];
+    setLayers(nextLayers);
+    setActiveLayerId(id);
+    const objs = objectsRef.current.map((o) => (o.id === objectId ? { ...o, layerId: id } : o));
+    objectsRef.current = objs;
+    setObjects(objs);
+    renderAll(nextLayers, objs, selectedIdRef.current);
+  }, [renderAll]);
+
+  const snapSelectedRotation = useCallback(() => {
+    const id = selectedIdRef.current;
+    if (!id) return;
+    const obj = objectsRef.current.find((o) => o.id === id);
+    if (!obj) return;
+    const cur = obj.rotation ?? 0;
+    const snapped = (Math.round(cur / 45) * 45) % 360;
+    updateSelectedObj({ rotation: snapped });
+  }, [updateSelectedObj]);
+
   /** Finish inline text editing — remove the object if text is empty */
   function finishTextEditing() {
     const eid = editingTextIdRef.current;
@@ -2983,6 +3012,25 @@ async function runSmartSelect(
       loadSamModel();
     }
   }, [tool]);
+
+  // Close object context menu on outside click / Escape / scroll
+  useEffect(() => {
+    if (!contextMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (contextMenuRef.current && contextMenuRef.current.contains(e.target as Node)) return;
+      setContextMenu(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setContextMenu(null);
+    };
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', () => setContextMenu(null), true);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [contextMenu]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -3262,6 +3310,53 @@ async function runSmartSelect(
           </div>
         </div>
       )}
+
+      {/* Object right-click context menu */}
+      {contextMenu && (() => {
+        const obj = objects.find((o) => o.id === contextMenu.objectId);
+        if (!obj) return null;
+        const otherLayers = layers.filter((l) => l.id !== obj.layerId);
+        return (
+          <div
+            ref={contextMenuRef}
+            style={{ position: 'fixed', top: contextMenu.screenY, left: contextMenu.screenX, zIndex: 9998, background: '#fff', border: '3px solid #000', boxShadow: '4px 4px 0 #000', padding: 6, fontFamily: 'Poppins, sans-serif', minWidth: 200 }}
+          >
+            <button
+              style={{ ...S.smallBtn(), display: 'block', width: '100%', textAlign: 'left', marginBottom: 4 }}
+              onClick={() => { snapSelectedRotation(); setContextMenu(null); }}
+            >
+              Snap rotation to nearest 45°
+            </button>
+            <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '4px 0' }} />
+            <p style={{ ...S.label, fontSize: 10, margin: '2px 0 4px' }}>MOVE TO LAYER</p>
+            {otherLayers.length === 0 && (
+              <p style={{ fontSize: 11, color: '#666', margin: '0 0 4px', paddingLeft: 4 }}>No other layers</p>
+            )}
+            {otherLayers.map((l) => (
+              <button
+                key={l.id}
+                style={{ ...S.smallBtn(), display: 'block', width: '100%', textAlign: 'left', marginBottom: 2 }}
+                onClick={() => { moveObjectToLayer(contextMenu.objectId, l.id); setContextMenu(null); }}
+              >
+                {l.name}
+              </button>
+            ))}
+            <button
+              style={{ ...S.smallBtn('#2563eb', '#fff'), display: 'block', width: '100%', textAlign: 'left', marginTop: 4 }}
+              onClick={() => { moveObjectToNewLayer(contextMenu.objectId); setContextMenu(null); }}
+            >
+              + New layer
+            </button>
+            <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '4px 0' }} />
+            <button
+              style={{ ...S.smallBtn('#c00', '#fff'), display: 'block', width: '100%', textAlign: 'left' }}
+              onClick={() => { deleteSelected(); setContextMenu(null); }}
+            >
+              Delete object
+            </button>
+          </div>
+        );
+      })()}
 
       {/* Mask modify mode floating controls */}
       {modifyingMask && (
@@ -3670,21 +3765,6 @@ async function runSmartSelect(
                 onChange={(e) => updateSelectedObj({ opacity: parseInt(e.target.value) / 100 })}
                 style={{ width: '100%' }} />
 
-              <hr style={{ border: 'none', borderTop: '1px solid #ccc', margin: '8px 0' }} />
-              <label style={S.label}>Rotation: {Math.round(selObj.rotation ?? 0)}{'\u00B0'}</label>
-              <input type='range' min={0} max={359} value={Math.round(selObj.rotation ?? 0)}
-                onChange={(e) => updateSelectedObj({ rotation: parseInt(e.target.value) })}
-                style={{ width: '100%' }} />
-              <div style={{ display: 'flex', gap: 3, marginBottom: 4, flexWrap: 'wrap' }}>
-                {[0, 90, 180, 270].map((a) => (
-                  <button key={a} style={S.smallBtn()} onClick={() => updateSelectedObj({ rotation: a })}>{a}{'\u00B0'}</button>
-                ))}
-              </div>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 4, ...S.label, cursor: 'pointer', marginBottom: 0 }}>
-                <input type='checkbox' checked={snapRotation} onChange={(e) => setSnapRotation(e.target.checked)} />
-                Snap to 90{'\u00B0'}
-              </label>
-
               {(selObj.type === 'text' || isShapeKind(selObj.type) || selObj.type === 'image') && (
                 <EffectsEditor
                   title='EFFECTS'
@@ -3825,7 +3905,18 @@ async function runSmartSelect(
               }}
               onMouseMove={onMouseMove}
               onMouseUp={onMouseUp}
-              onContextMenu={(e) => { if (modifyingMaskRef.current) e.preventDefault(); }}
+              onContextMenu={(e) => {
+                if (modifyingMaskRef.current) { e.preventDefault(); return; }
+                const pos = getPos(e);
+                const hit = [...objectsRef.current].reverse().find((o) => hitTest(o, pos.x, pos.y));
+                if (hit) {
+                  e.preventDefault();
+                  setSelectedId(hit.id);
+                  selectedIdRef.current = hit.id;
+                  renderAll(layersRef.current, objectsRef.current, hit.id);
+                  setContextMenu({ screenX: e.clientX, screenY: e.clientY, objectId: hit.id });
+                }
+              }}
               onMouseLeave={(e) => {
                 cursorPos.current = null;
                 // In mask modify mode, just stop drawing but keep state
