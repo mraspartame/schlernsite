@@ -891,6 +891,8 @@ export default function PaintEditor() {
   const lastPos = useRef<{ x: number; y: number } | null>(null);
   const strokePoints = useRef<{ x: number; y: number }[]>([]);
   const pixelSnapshot = useRef<ImageData | null>(null);
+  const brushStrokeSnapshot = useRef<ImageData | null>(null);
+  const brushStrokeParams = useRef<{ bk: BrushKind; size: number; color: string; opacity: number } | null>(null);
 
   // For select tool drag
   const dragMode = useRef<'move' | 'resize' | 'rotate' | null>(null);
@@ -2283,6 +2285,16 @@ async function runSmartSelect(
       saveHistory();
       strokePoints.current = [pos];
       const bk = brushKindRef.current;
+      if (t === 'pencil') {
+        const dw = docWRef.current, dh = docHRef.current;
+        brushStrokeSnapshot.current = ctx.getImageData(0, 0, dw, dh);
+        brushStrokeParams.current = {
+          bk,
+          size: brushSizeRef.current,
+          color: colorRef.current,
+          opacity: opacityRef.current,
+        };
+      }
       if (t === 'eraser') {
         ctx.globalAlpha = opacityRef.current;
         ctx.lineCap = 'round';
@@ -2618,6 +2630,94 @@ async function runSmartSelect(
     if (t === 'pencil' || t === 'eraser' || t === 'blur') {
       ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = 'source-over';
+    }
+
+    // Convert brush stroke to a moveable object
+    if (t === 'pencil' && brushStrokeParams.current && brushStrokeSnapshot.current && strokePoints.current.length > 0) {
+      const params = brushStrokeParams.current;
+      const points = strokePoints.current.slice();
+      const snap = brushStrokeSnapshot.current;
+      brushStrokeParams.current = null;
+      brushStrokeSnapshot.current = null;
+      strokePoints.current = [];
+
+      // Restore pre-stroke pixels so the stroke lives only in the new object
+      ctx.putImageData(snap, 0, 0);
+
+      // Compute padded bbox around stroke points, clamped to doc
+      const { bk, size, color, opacity: op } = params;
+      const pad = Math.ceil(size * (bk === 'airbrush' ? 2 : bk === 'marker' ? 1 : 1) + 4);
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of points) {
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+      }
+      const dw = docWRef.current, dh = docHRef.current;
+      minX = Math.max(0, Math.floor(minX - pad));
+      minY = Math.max(0, Math.floor(minY - pad));
+      maxX = Math.min(dw, Math.ceil(maxX + pad));
+      maxY = Math.min(dh, Math.ceil(maxY + pad));
+      const bw = maxX - minX;
+      const bh = maxY - minY;
+      if (bw < 1 || bh < 1) {
+        renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+        return;
+      }
+
+      // Render the stroke onto a fresh canvas at bbox size
+      const strokeC = document.createElement('canvas');
+      strokeC.width = bw;
+      strokeC.height = bh;
+      const sctx = strokeC.getContext('2d')!;
+      sctx.save();
+      sctx.translate(-minX, -minY);
+      configureBrush(sctx, bk, color, size, op);
+      if (bk === 'pencil' || bk === 'marker') {
+        sctx.beginPath();
+        sctx.moveTo(points[0].x, points[0].y);
+        if (points.length === 1) {
+          sctx.lineTo(points[0].x + 0.1, points[0].y + 0.1);
+        } else {
+          for (let i = 1; i < points.length; i++) sctx.lineTo(points[i].x, points[i].y);
+        }
+        sctx.stroke();
+      } else if (bk === 'airbrush') {
+        airbrushStamp(sctx, points[0].x, points[0].y, color, size, op);
+        for (let i = 1; i < points.length; i++) {
+          const prev = points[i - 1], cur = points[i];
+          stampAlongSegment((sx, sy) => airbrushStamp(sctx, sx, sy, color, size, op), prev.x, prev.y, cur.x, cur.y, Math.max(2, size / 3));
+        }
+      } else if (bk === 'calligraphy') {
+        calligraphyStamp(sctx, points[0].x, points[0].y, color, size, op);
+        for (let i = 1; i < points.length; i++) {
+          const prev = points[i - 1], cur = points[i];
+          stampAlongSegment((sx, sy) => calligraphyStamp(sctx, sx, sy, color, size, op), prev.x, prev.y, cur.x, cur.y, Math.max(1, size / 4));
+        }
+      }
+      sctx.restore();
+
+      const dataUrl = strokeC.toDataURL();
+      const newId = uid();
+      const layerId = al;
+      const img = new Image();
+      img.onload = () => {
+        imageCache.current.set(dataUrl, img);
+        const newObj: PaintObj = {
+          id: newId, layerId, type: 'image',
+          x: minX, y: minY, w: bw, h: bh, opacity: 1,
+          src: dataUrl, lockAspect: true, naturalAr: bw / bh,
+        };
+        const next = [...objectsRef.current, newObj];
+        objectsRef.current = next;
+        setObjects(next);
+        renderAll(layersRef.current, next, selectedIdRef.current);
+      };
+      img.src = dataUrl;
+
+      renderAll(layersRef.current, objectsRef.current, selectedIdRef.current);
+      return;
     }
 
     if (t === 'shape' && startPos.current) {
@@ -3441,7 +3541,7 @@ async function runSmartSelect(
 
       {/* Top bar */}
       <div style={{ border: fullPage ? 'none' : '3px solid #000', borderBottom: '3px solid #000', background: '#fff', padding: '8px 12px', marginBottom: fullPage ? 0 : 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', boxShadow: fullPage ? 'none' : '4px 4px 0 #000', flexShrink: 0 }}>
-        <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 20 }}>{'\uD83C\uDFA8'} Paint</strong>
+        <strong style={{ fontFamily: 'DM Serif Text, serif', fontSize: 20 }}>{'\uD83C\uDFA8'} Scribble</strong>
         <button style={S.smallBtn()} onClick={newCanvas}>New</button>
         <label style={{ ...S.smallBtn(), cursor: 'pointer' }}>
           Add image
