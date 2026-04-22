@@ -3237,7 +3237,7 @@ async function runSmartSelect(
   // ── JSX ────────────────────────────────────────────────────────────────────
 
   return (
-    <div style={fullPage ? { position: 'fixed', inset: 0, zIndex: 9000, background: '#fff', display: 'flex', flexDirection: 'column', overflow: 'hidden' } : { maxWidth: 1340, margin: '0 auto' }}>
+    <div style={fullPage ? { position: 'fixed', inset: 0, zIndex: 9000, background: '#fff', display: 'flex', flexDirection: 'column', overflow: 'hidden' } : { width: '100%' }}>
       {/* Paste dialog */}
       {pasteDialog && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
